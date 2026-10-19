@@ -73,11 +73,115 @@ impl Document {
         self.nodes[parent.0].children.push(child);
     }
 
+    pub fn insert_before(&mut self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
+        if parent.0 >= self.nodes.len() || child.0 >= self.nodes.len() || parent == child {
+            return;
+        }
+        if let Some(old) = self.nodes[child.0].parent {
+            self.nodes[old.0].children.retain(|id| *id != child);
+        }
+        self.nodes[child.0].parent = Some(parent);
+        let children = &mut self.nodes[parent.0].children;
+        if let Some(before) = before {
+            if let Some(index) = children.iter().position(|id| *id == before) {
+                children.insert(index, child);
+                return;
+            }
+        }
+        children.push(child);
+    }
+
+    pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        if parent.0 >= self.nodes.len() || child.0 >= self.nodes.len() {
+            return;
+        }
+        self.nodes[parent.0].children.retain(|id| *id != child);
+        if self.nodes[child.0].parent == Some(parent) {
+            self.nodes[child.0].parent = None;
+        }
+    }
+
+    pub fn remove(&mut self, id: NodeId) {
+        if let Some(parent) = self.nodes.get(id.0).and_then(|node| node.parent) {
+            self.remove_child(parent, id);
+        }
+    }
+
     pub fn clear_children(&mut self, id: NodeId) {
         let children = std::mem::take(&mut self.nodes[id.0].children);
         for child in children {
             self.nodes[child.0].parent = None;
         }
+    }
+
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> Option<NodeId> {
+        if id.0 >= self.nodes.len() {
+            return None;
+        }
+        let data = match &self.nodes[id.0].data {
+            NodeData::Document => return None,
+            NodeData::Text(text) => NodeData::Text(text.clone()),
+            NodeData::Element { tag, attrs } => NodeData::Element {
+                tag: tag.clone(),
+                attrs: attrs.clone(),
+            },
+        };
+        let created = self.create(data);
+        if deep {
+            let children = self.nodes[id.0].children.clone();
+            for child in children {
+                if let Some(cloned) = self.clone_node(child, true) {
+                    self.append_child(created, cloned);
+                }
+            }
+        }
+        Some(created)
+    }
+
+    pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let NodeData::Element { attrs, .. } = &mut self.nodes[id.0].data else {
+            return;
+        };
+        attrs.retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+    }
+
+    pub fn has_attr(&self, id: NodeId, name: &str) -> bool {
+        self.attr(id, name).is_some()
+    }
+
+    pub fn tag_name(&self, id: NodeId) -> Option<&str> {
+        match &self.nodes[id.0].data {
+            NodeData::Element { tag, .. } => Some(tag.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn is_element(&self, id: NodeId) -> bool {
+        matches!(self.nodes[id.0].data, NodeData::Element { .. })
+    }
+
+    pub fn element_children(&self, id: NodeId) -> Vec<NodeId> {
+        self.nodes[id.0]
+            .children
+            .iter()
+            .copied()
+            .filter(|child| self.is_element(*child))
+            .collect()
+    }
+
+    pub fn parent_of(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes.get(id.0).and_then(|node| node.parent)
+    }
+
+    pub fn is_connected(&self, id: NodeId) -> bool {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if node == self.root() {
+                return true;
+            }
+            current = self.parent_of(node);
+        }
+        false
     }
 
     pub fn set_text(&mut self, id: NodeId, text: String) {

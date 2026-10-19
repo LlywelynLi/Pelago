@@ -24,11 +24,16 @@ cargo run -- --html "<html>"
 
 ## JavaScript
 
-内嵌 [Boa](https://boajs.dev/) 引擎。会执行内联脚本和 `<script src>`，并提供 `location`、`navigator`、`console`、`Image`、`define` / `require`（最小 AMD）、`setTimeout` / `setInterval`（回调立即执行一次），以及最小 DOM API：`getElementById`、`querySelector`、`querySelectorAll`、`getElementsByTagName`、`createElement`、`appendChild`、`textContent`、`className`、`innerHTML`、`src`、`addEventListener`（空实现）。
+内嵌 [Boa](https://boajs.dev/) 引擎，覆盖浏览器常用宿主能力：
+
+- **DOM**：`createElement` / `createTextNode` / `createDocumentFragment`、`appendChild` / `insertBefore` / `removeChild` / `cloneNode`、属性读写、`querySelector`、父子节点关系
+- **事件**：`addEventListener` / `dispatchEvent`，页面脚本跑完后会触发 `DOMContentLoaded` 和 `load`
+- **模块加载**：内联与外链 `<script>`、动态插入的 `script`、AMD `define` / `require`（可拉取 URL）
+- **其他**：`location`、`navigator`、`console`、`Image`、`XMLHttpRequest`、`fetch`、`localStorage`、最小 `$`
 
 样式会下载 `<link rel="stylesheet">` 和 `@import`。选择器支持标签、class、id、后代和子代。布局支持 `flex`、`grid`、`float` 和 `position: absolute`。
 
-`$`、`bds`、`F` 是页面脚本自己创建的全局变量。前面的脚本如果中途抛错，这些名字就不会出现。当前没有真正的事件循环和完整 DOM。
+真实浏览器级事件循环、完整 CSSOM 回流和全部 Web API 仍未实现；复杂站点可能仍有脚本失败，会汇总提示。
 
 ## 构建
 

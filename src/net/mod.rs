@@ -1,4 +1,4 @@
 mod fetch;
 pub mod url;
 
-pub use fetch::{fetch, fetch_bytes};
+pub use fetch::{exchange, fetch, fetch_bytes};

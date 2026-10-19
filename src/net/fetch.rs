@@ -57,6 +57,50 @@ pub struct BytesResponse {
     pub bytes: Vec<u8>,
 }
 
+pub struct HttpResponse {
+    pub status: u16,
+    pub text: String,
+}
+
+pub fn exchange(method: &str, url: &str, body: Option<&str>) -> Result<HttpResponse, FetchError> {
+    let url = url.trim();
+    let scheme = url.split(':').next().unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(FetchError::BadUrl("只支持 http 和 https 地址".to_string()));
+    }
+    let config = Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .max_redirects(5)
+        .http_status_as_error(false)
+        .build();
+    let agent: Agent = config.into();
+    let method = method.trim().to_ascii_uppercase();
+    let mut response = match method.as_str() {
+        "POST" => agent.post(url).send(body.unwrap_or("")),
+        "PUT" => agent.put(url).send(body.unwrap_or("")),
+        "DELETE" => agent.delete(url).call(),
+        "HEAD" => agent.head(url).call(),
+        _ => agent.get(url).call(),
+    }
+    .map_err(|err| FetchError::Http(err.to_string()))?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_BODY)
+        .read_to_vec()
+        .map_err(|err| FetchError::Body(err.to_string()))?;
+    Ok(HttpResponse {
+        status,
+        text: decode_html(&bytes, content_type.as_deref()),
+    })
+}
+
 pub fn fetch_bytes(url: &str, limit: u64) -> Result<BytesResponse, FetchError> {
     let url = url.trim();
     let scheme = url.split(':').next().unwrap_or("");

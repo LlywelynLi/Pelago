@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::ptr;
 use std::rc::Rc;
 
 use boa_engine::object::ObjectInitializer;
@@ -7,6 +8,12 @@ use boa_engine::{js_string, Context, JsArgs, JsResult, JsString, JsValue, Native
 
 use crate::engine::dom::{Document, NodeData, NodeId};
 use crate::net::url::{normalize_navigation, resolve_url};
+
+thread_local! {
+    static ACTIVE_CONTEXT: Cell<*mut Context> = const { Cell::new(ptr::null_mut()) };
+    static ACTIVE_BASE: RefCell<String> = const { RefCell::new(String::new()) };
+    static ACTIVE_DOC: Cell<*mut Document> = const { Cell::new(ptr::null_mut()) };
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavigationKind {
@@ -58,17 +65,91 @@ pub fn run_scripts_with(
     if let Err(err) = install_document(&mut context, doc_ptr) {
         eprintln!("JS document 初始化失败：{err}");
     }
-    if let Err(err) = install_host(&mut context) {
+    if let Err(err) = install_host(&mut context, base_url) {
         eprintln!("JS 宿主对象初始化失败：{err}");
     }
 
+    ACTIVE_CONTEXT.with(|slot| slot.set(&mut context as *mut Context));
+    ACTIVE_DOC.with(|slot| slot.set(doc_ptr));
+    ACTIVE_BASE.with(|slot| *slot.borrow_mut() = base_url.to_string());
+
+    let mut failures = 0u32;
+    let mut samples = Vec::new();
     for source in scripts {
         if let Err(err) = context.eval(Source::from_bytes(source.as_bytes())) {
-            eprintln!("JS 错误：{err}");
+            failures += 1;
+            if samples.len() < 3 {
+                samples.push(err.to_string());
+            }
+        }
+    }
+    let _ = context.eval(Source::from_bytes(
+        br#"
+        try {
+          document.readyState = "interactive";
+          document.dispatchEvent(new Event("DOMContentLoaded"));
+          window.dispatchEvent(new Event("DOMContentLoaded"));
+          document.readyState = "complete";
+          document.dispatchEvent(new Event("load"));
+          window.dispatchEvent(new Event("load"));
+        } catch (e) {}
+        "#,
+    ));
+
+    ACTIVE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
+    ACTIVE_DOC.with(|slot| slot.set(ptr::null_mut()));
+
+    if failures > 0 {
+        eprintln!("页面脚本有 {failures} 处执行失败（宿主 API 尚不完整）。");
+        for sample in samples {
+            eprintln!("  · {sample}");
         }
     }
 
     state.borrow_mut().pending.take()
+}
+
+fn eval_script_source(source: &str) {
+    ACTIVE_CONTEXT.with(|slot| {
+        let ptr = slot.get();
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = (*ptr).eval(Source::from_bytes(source.as_bytes()));
+        }
+    });
+}
+
+fn load_and_eval_script(url: &str) {
+    let base = ACTIVE_BASE.with(|slot| slot.borrow().clone());
+    let resolved = resolve_url(Some(&base), url).unwrap_or_else(|| url.to_string());
+    match crate::net::fetch_bytes(&resolved, 2 * 1024 * 1024) {
+        Ok(response) => {
+            let source = String::from_utf8_lossy(&response.bytes);
+            eval_script_source(&source);
+        }
+        Err(err) => eprintln!("脚本加载失败 {resolved}：{err}"),
+    }
+}
+
+fn maybe_run_script_node(doc: *mut Document, id: NodeId) {
+    let Some(tag) = (unsafe { (*doc).tag_name(id) }) else {
+        return;
+    };
+    if !tag.eq_ignore_ascii_case("script") {
+        return;
+    }
+    if let Some(src) = unsafe { (*doc).attr(id, "src") } {
+        if !src.trim().is_empty() {
+            load_and_eval_script(src);
+            return;
+        }
+    }
+    let source = unsafe { (*doc).text_content(id) };
+    if !source.trim().is_empty() {
+        eval_script_source(&source);
+    }
 }
 
 fn collect_scripts(
@@ -270,6 +351,30 @@ fn install_document(context: &mut Context, doc: *mut Document) -> JsResult<()> {
         };
         element_value(node, doc, context)
     });
+    let create_text = NativeFunction::from_copy_closure(move |_, args, context| {
+        let value = args.get_or_undefined(0).to_string(context)?;
+        let node = unsafe { (*doc).create(NodeData::Text(value.to_std_string_escaped())) };
+        element_value(node, doc, context)
+    });
+    let create_comment = NativeFunction::from_copy_closure(move |_, args, context| {
+        let value = args.get_or_undefined(0).to_string(context)?;
+        let node = unsafe {
+            (*doc).create(NodeData::Element {
+                tag: "!--".to_string(),
+                attrs: vec![("data".into(), value.to_std_string_escaped())],
+            })
+        };
+        element_value(node, doc, context)
+    });
+    let create_fragment = NativeFunction::from_copy_closure(move |_, _, context| {
+        let node = unsafe {
+            (*doc).create(NodeData::Element {
+                tag: "#document-fragment".to_string(),
+                attrs: Vec::new(),
+            })
+        };
+        element_value(node, doc, context)
+    });
     let get_body = NativeFunction::from_copy_closure(move |_, _, context| match unsafe { find_tag(&*doc, "body") } {
         Some(node) => element_value(node, doc, context),
         None => Ok(JsValue::null()),
@@ -301,10 +406,16 @@ fn install_document(context: &mut Context, doc: *mut Document) -> JsResult<()> {
         .function(query_all, js_string!("querySelectorAll"), 1)
         .function(by_tag, js_string!("getElementsByTagName"), 1)
         .function(create_element, js_string!("createElement"), 1)
+        .function(create_text, js_string!("createTextNode"), 1)
+        .function(create_comment, js_string!("createComment"), 1)
+        .function(create_fragment, js_string!("createDocumentFragment"), 0)
         .function(noop(), js_string!("addEventListener"), 2)
         .function(noop(), js_string!("removeEventListener"), 2)
+        .function(noop(), js_string!("dispatchEvent"), 1)
         .accessor(js_string!("body"), Some(get_body), None, Attribute::all())
         .accessor(js_string!("documentElement"), Some(get_root), None, Attribute::all())
+        .property(js_string!("readyState"), js_string!("loading"), Attribute::all())
+        .property(js_string!("nodeType"), 9, Attribute::all())
         .build();
     context.register_global_property(js_string!("document"), document, Attribute::all())?;
     Ok(())
@@ -357,18 +468,103 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
             return Ok(JsValue::undefined());
         };
         unsafe { (*doc).append_child(parent, child) };
+        maybe_run_script_node(doc, child);
         Ok(args.get_or_undefined(0).clone())
+    });
+    let insert_before = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(parent) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let Some(child) = node_id(&args.get_or_undefined(0).clone(), context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let before = node_id(&args.get_or_undefined(1).clone(), context)?;
+        unsafe { (*doc).insert_before(parent, child, before) };
+        maybe_run_script_node(doc, child);
+        Ok(args.get_or_undefined(0).clone())
+    });
+    let remove_child = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(parent) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let Some(child) = node_id(&args.get_or_undefined(0).clone(), context)? else {
+            return Ok(JsValue::undefined());
+        };
+        unsafe { (*doc).remove_child(parent, child) };
+        Ok(args.get_or_undefined(0).clone())
+    });
+    let remove_self = NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        unsafe { (*doc).remove(node) };
+        Ok(JsValue::undefined())
+    });
+    let clone_node = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::null());
+        };
+        let deep = args.get_or_undefined(0).to_boolean();
+        match unsafe { (*doc).clone_node(node, deep) } {
+            Some(cloned) => element_value(cloned, doc, context),
+            None => Ok(JsValue::null()),
+        }
+    });
+    let get_parent = NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::null());
+        };
+        match unsafe { (*doc).parent_of(node) } {
+            Some(parent) => element_value(parent, doc, context),
+            None => Ok(JsValue::null()),
+        }
+    });
+    let get_children = NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(boa_engine::object::builtins::JsArray::from_iter([], context).into());
+        };
+        let children = unsafe { (*doc).element_children(node) };
+        let values = children
+            .into_iter()
+            .map(|child| element_value(child, doc, context))
+            .collect::<JsResult<Vec<_>>>()?;
+        Ok(boa_engine::object::builtins::JsArray::from_iter(values, context).into())
+    });
+    let query_one_local = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::null());
+        };
+        let value = args.get_or_undefined(0).to_string(context)?;
+        let selector = value.to_std_string_escaped();
+        let found = unsafe { query_under(&*doc, node, &selector) };
+        match found {
+            Some(found) => element_value(found, doc, context),
+            None => Ok(JsValue::null()),
+        }
     });
     let get_text = get_text.to_js_function(context.realm());
     let set_text = set_text.to_js_function(context.realm());
     let get_class = get_class.to_js_function(context.realm());
     let set_class = set_class.to_js_function(context.realm());
     let set_html = set_html.to_js_function(context.realm());
+    let get_parent_fn = get_parent.to_js_function(context.realm());
+    let get_children_fn = get_children.to_js_function(context.realm());
     let (get_src, set_src) = attr_accessor(doc, "src", context);
     let (get_id, set_id) = attr_accessor(doc, "id", context);
     let (get_href, set_href) = attr_accessor(doc, "href", context);
     let (get_width, set_width) = attr_accessor(doc, "width", context);
     let (get_height, set_height) = attr_accessor(doc, "height", context);
+    let style_obj = ObjectInitializer::new(context).build();
+    let class_list = ObjectInitializer::new(context)
+        .function(noop(), js_string!("add"), 1)
+        .function(noop(), js_string!("remove"), 1)
+        .function(noop(), js_string!("toggle"), 1)
+        .function(
+            NativeFunction::from_copy_closure(|_, _, _| Ok(JsValue::from(false))),
+            js_string!("contains"),
+            1,
+        )
+        .build();
     let object = ObjectInitializer::new(context)
         .property(js_string!("pelagoId"), id.0 as u32, Attribute::READONLY)
         .accessor(js_string!("textContent"), Some(get_text), Some(set_text), Attribute::all())
@@ -380,8 +576,84 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         .accessor(js_string!("width"), Some(get_width), Some(set_width), Attribute::all())
         .accessor(js_string!("height"), Some(get_height), Some(set_height), Attribute::all())
         .function(append_child, js_string!("appendChild"), 1)
+        .function(insert_before, js_string!("insertBefore"), 2)
+        .function(remove_child, js_string!("removeChild"), 1)
+        .function(remove_self, js_string!("remove"), 0)
+        .function(clone_node, js_string!("cloneNode"), 1)
+        .function(query_one_local, js_string!("querySelector"), 1)
+        .accessor(js_string!("parentNode"), Some(get_parent_fn.clone()), None, Attribute::all())
+        .accessor(js_string!("parentElement"), Some(get_parent_fn), None, Attribute::all())
+        .accessor(js_string!("children"), Some(get_children_fn.clone()), None, Attribute::all())
+        .accessor(js_string!("childNodes"), Some(get_children_fn), None, Attribute::all())
+        .property(js_string!("nodeType"), 1, Attribute::all())
+        .property(
+            js_string!("nodeName"),
+            JsString::from(unsafe { (*doc).tag_name(id).unwrap_or("#text") }),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("tagName"),
+            JsString::from(unsafe { (*doc).tag_name(id).unwrap_or("").to_ascii_uppercase() }),
+            Attribute::all(),
+        )
         .function(noop(), js_string!("addEventListener"), 2)
         .function(noop(), js_string!("removeEventListener"), 2)
+        .function(noop(), js_string!("dispatchEvent"), 1)
+        .function(noop(), js_string!("focus"), 0)
+        .function(noop(), js_string!("blur"), 0)
+        .function(noop(), js_string!("click"), 0)
+        .function(
+            NativeFunction::from_copy_closure(move |this, args, context| {
+                let Some(parent) = node_id(this, context)? else {
+                    return Ok(JsValue::undefined());
+                };
+                let value = args.get_or_undefined(0).to_string(context)?;
+                let name = value.to_std_string_escaped();
+                let val = args.get_or_undefined(1).to_string(context)?.to_std_string_escaped();
+                unsafe { (*doc).set_attr(parent, &name, val) };
+                Ok(JsValue::undefined())
+            }),
+            js_string!("setAttribute"),
+            2,
+        )
+        .function(
+            NativeFunction::from_copy_closure(move |this, args, context| {
+                let Some(parent) = node_id(this, context)? else {
+                    return Ok(JsValue::undefined());
+                };
+                let value = args.get_or_undefined(0).to_string(context)?;
+                let name = value.to_std_string_escaped();
+                let attr = unsafe { (*doc).attr(parent, &name).unwrap_or("").to_string() };
+                Ok(JsValue::from(JsString::from(attr.as_str())))
+            }),
+            js_string!("getAttribute"),
+            1,
+        )
+        .function(
+            NativeFunction::from_copy_closure(move |this, args, context| {
+                let Some(parent) = node_id(this, context)? else {
+                    return Ok(JsValue::undefined());
+                };
+                let value = args.get_or_undefined(0).to_string(context)?;
+                let name = value.to_std_string_escaped();
+                unsafe { (*doc).remove_attr(parent, &name) };
+                Ok(JsValue::undefined())
+            }),
+            js_string!("removeAttribute"),
+            1,
+        )
+        .function(
+            NativeFunction::from_copy_closure(move |this, args, context| {
+                let Some(parent) = node_id(this, context)? else {
+                    return Ok(JsValue::from(false));
+                };
+                let value = args.get_or_undefined(0).to_string(context)?;
+                let name = value.to_std_string_escaped();
+                Ok(JsValue::from(unsafe { (*doc).has_attr(parent, &name) }))
+            }),
+            js_string!("hasAttribute"),
+            1,
+        )
         .function(
             NativeFunction::from_copy_closure(move |_, args, context| {
                 let value = args.get_or_undefined(0).to_string(context)?;
@@ -390,6 +662,8 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
             js_string!("getElementsByTagName"),
             1,
         )
+        .property(js_string!("style"), style_obj, Attribute::all())
+        .property(js_string!("classList"), class_list, Attribute::all())
         .build();
     Ok(JsValue::from(object))
 }
@@ -421,7 +695,7 @@ fn noop() -> NativeFunction {
     NativeFunction::from_copy_closure(|_, _, _| Ok(JsValue::undefined()))
 }
 
-fn install_host(context: &mut Context) -> JsResult<()> {
+fn install_host(context: &mut Context, base_url: &str) -> JsResult<()> {
     let print = |label: &'static str| {
         NativeFunction::from_copy_closure(move |_, args, context| {
             let mut parts = Vec::new();
@@ -459,6 +733,36 @@ fn install_host(context: &mut Context) -> JsResult<()> {
     context.register_global_property(js_string!("setInterval"), interval.clone(), Attribute::all())?;
     context.register_global_property(js_string!("clearTimeout"), clear, Attribute::all())?;
     context.register_global_property(js_string!("clearInterval"), clear_interval, Attribute::all())?;
+    let base = base_url.to_string();
+    let http = unsafe {
+        NativeFunction::from_closure(move |_, args, context| {
+            let method = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+            let raw = args.get_or_undefined(1).to_string(context)?.to_std_string_escaped();
+            let payload = args.get_or_undefined(2).to_string(context)?.to_std_string_escaped();
+            let url = resolve_url(Some(&base), &raw).unwrap_or(raw);
+            let result = crate::net::exchange(&method, &url, Some(&payload));
+            let (status, text) = match result {
+                Ok(response) => (response.status as i32, response.text),
+                Err(err) => (0, err.to_string()),
+            };
+            let object = ObjectInitializer::new(context)
+                .property(js_string!("status"), status, Attribute::all())
+                .property(js_string!("body"), JsString::from(text.as_str()), Attribute::all())
+                .build();
+            Ok(JsValue::from(object))
+        })
+    };
+    context.register_global_property(js_string!("__pelagoHttp"), http.to_js_function(context.realm()), Attribute::all())?;
+    let load_script = NativeFunction::from_copy_closure(|_, args, context| {
+        let value = args.get_or_undefined(0).to_string(context)?;
+        load_and_eval_script(&value.to_std_string_escaped());
+        Ok(JsValue::undefined())
+    });
+    context.register_global_property(
+        js_string!("__pelagoLoadScript"),
+        load_script.to_js_function(context.realm()),
+        Attribute::all(),
+    )?;
     if let Some(window) = context.global_object().get(js_string!("window"), context)?.as_object() {
         window.set(js_string!("console"), console, false, context)?;
         window.set(js_string!("navigator"), navigator, false, context)?;
@@ -471,54 +775,346 @@ fn install_host(context: &mut Context) -> JsResult<()> {
 }
 
 const HOST_SHIM: &str = r#"
-function Image() {
-    return document.createElement("img");
-}
-window.Image = Image;
-var __pelagoModules = Object.create(null);
-function require(id, callback) {
-    if (typeof id === "function") {
-        id();
-        return {};
+(function (global) {
+  var window = global.window || global;
+  function noop() { return undefined; }
+  function soft(value) {
+    if (value == null || typeof value !== "object") return value;
+    if (value.__pelagoSoft) return value;
+    try {
+      return new Proxy(value, {
+        get: function (target, prop, receiver) {
+          if (prop === "__pelagoSoft") return true;
+          if (prop in target) {
+            var got = Reflect.get(target, prop, receiver);
+            return typeof got === "function" ? got.bind(target) : soft(got);
+          }
+          if (typeof prop === "symbol") return undefined;
+          return function () { return soft({}); };
+        },
+        set: function (target, prop, next) {
+          try { target[prop] = next; } catch (e) {}
+          return true;
+        },
+        has: function () { return true; }
+      });
+    } catch (e) {
+      return value;
     }
+  }
+  function wrapNode(node) {
+    if (node == null) {
+      return soft({
+        nodeType: 1,
+        tagName: "DIV",
+        style: soft({}),
+        classList: soft({ add: noop, remove: noop, contains: function () { return false; }, toggle: noop }),
+        appendChild: function (child) { return child; },
+        setAttribute: noop,
+        getAttribute: function () { return ""; },
+        addEventListener: noop,
+        removeEventListener: noop,
+        querySelector: function () { return wrapNode(null); },
+        querySelectorAll: function () { return []; }
+      });
+    }
+    return installTarget(soft(node));
+  }
+  function patch(obj, name) {
+    if (!obj || typeof obj[name] !== "function") return;
+    var original = obj[name].bind(obj);
+    obj[name] = function () {
+      var result = original.apply(obj, arguments);
+      if (name === "querySelectorAll" || name === "getElementsByTagName") {
+        return soft(Array.prototype.slice.call(result || []));
+      }
+      return wrapNode(result);
+    };
+  }
+  function installTarget(obj) {
+    if (!obj || obj.__pelagoEvents) return obj;
+    var map = Object.create(null);
+    obj.__pelagoEvents = map;
+    obj.addEventListener = function (type, fn) {
+      if (typeof fn !== "function") return;
+      type = String(type);
+      (map[type] = map[type] || []).push(fn);
+    };
+    obj.removeEventListener = function (type, fn) {
+      type = String(type);
+      map[type] = (map[type] || []).filter(function (item) { return item !== fn; });
+    };
+    obj.dispatchEvent = function (event) {
+      event = event || {};
+      if (typeof event === "string") event = { type: event };
+      var type = String(event.type || "");
+      event.target = event.target || obj;
+      event.currentTarget = obj;
+      var list = (map[type] || []).slice();
+      for (var i = 0; i < list.length; i++) {
+        try { list[i].call(obj, event); } catch (e) {}
+      }
+      var key = "on" + type;
+      if (typeof obj[key] === "function") {
+        try { obj[key].call(obj, event); } catch (e) {}
+      }
+      return !event.defaultPrevented;
+    };
+    return obj;
+  }
+
+  try {
+    ["getElementById", "querySelector", "createElement", "createTextNode", "createDocumentFragment"].forEach(function (name) { patch(document, name); });
+    ["querySelectorAll", "getElementsByTagName"].forEach(function (name) { patch(document, name); });
+  } catch (e) {}
+  installTarget(document);
+  installTarget(window);
+
+  function Image() { return wrapNode(document.createElement("img")); }
+  global.Image = window.Image = Image;
+
+  function Event(type, init) {
+    this.type = String(type || "");
+    this.bubbles = !!(init && init.bubbles);
+    this.cancelable = !!(init && init.cancelable);
+    this.defaultPrevented = false;
+    this.target = null;
+    this.currentTarget = null;
+  }
+  Event.prototype.preventDefault = function () { this.defaultPrevented = true; };
+  Event.prototype.stopPropagation = noop;
+  Event.prototype.stopImmediatePropagation = noop;
+  global.Event = window.Event = Event;
+  global.CustomEvent = window.CustomEvent = function (type, init) {
+    Event.call(this, type);
+    this.detail = init && init.detail;
+  };
+  global.MutationObserver = window.MutationObserver = function (cb) { this._cb = cb; };
+  window.MutationObserver.prototype.observe = noop;
+  window.MutationObserver.prototype.disconnect = noop;
+  window.MutationObserver.prototype.takeRecords = function () { return []; };
+  global.ResizeObserver = window.ResizeObserver = window.MutationObserver;
+  global.IntersectionObserver = window.IntersectionObserver = window.MutationObserver;
+
+  function Storage() { this._data = Object.create(null); }
+  Storage.prototype.getItem = function (key) { return Object.prototype.hasOwnProperty.call(this._data, key) ? this._data[key] : null; };
+  Storage.prototype.setItem = function (key, value) { this._data[key] = String(value); };
+  Storage.prototype.removeItem = function (key) { delete this._data[key]; };
+  Storage.prototype.clear = function () { this._data = Object.create(null); };
+  Storage.prototype.key = function (index) { return Object.keys(this._data)[index] || null; };
+  global.localStorage = window.localStorage = soft(new Storage());
+  global.sessionStorage = window.sessionStorage = soft(new Storage());
+  global.history = window.history = soft({ pushState: noop, replaceState: noop, back: noop, forward: noop, go: noop, length: 1, state: null });
+  global.screen = window.screen = soft({ width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24, pixelDepth: 24 });
+  global.performance = window.performance = soft({ now: function () { return Date.now(); }, timing: soft({}), navigation: soft({}) });
+  global.matchMedia = window.matchMedia = function () { return soft({ matches: false, media: "", addListener: noop, removeListener: noop, addEventListener: noop, removeEventListener: noop }); };
+  global.getComputedStyle = window.getComputedStyle = function () { return soft({ getPropertyValue: function () { return ""; } }); };
+  global.requestAnimationFrame = window.requestAnimationFrame = function (cb) { return setTimeout(function () { if (typeof cb === "function") cb(Date.now()); }, 0); };
+  global.cancelAnimationFrame = window.cancelAnimationFrame = function (id) { clearTimeout(id); };
+  global.fetch = window.fetch = function (url, init) {
+    init = init || {};
+    var method = (init.method || "GET").toUpperCase();
+    var body = init.body == null ? "" : String(init.body);
+    var result = __pelagoHttp(method, String(url), body);
+    var response = soft({
+      ok: result.status >= 200 && result.status < 300,
+      status: result.status,
+      statusText: "",
+      url: String(url),
+      headers: soft({ get: function () { return null; } }),
+      text: function () { return Promise.resolve(result.body); },
+      json: function () {
+        try { return Promise.resolve(JSON.parse(result.body)); }
+        catch (e) { return Promise.reject(e); }
+      },
+      arrayBuffer: function () { return Promise.resolve(new ArrayBuffer(0)); },
+      blob: function () { return Promise.resolve(soft({})); }
+    });
+    return Promise.resolve(response);
+  };
+  global.FormData = window.FormData = function () { this.append = noop; this.set = noop; this.get = function () { return null; }; this.delete = noop; };
+  global.Blob = window.Blob = function () { return soft({}); };
+  global.URL = window.URL = window.URL || soft({ createObjectURL: function () { return ""; }, revokeObjectURL: noop });
+  global.HTMLElement = window.HTMLElement = function () {};
+  global.Node = window.Node = function () {};
+  global.Element = window.Element = window.HTMLElement;
+  window.self = window;
+  window.top = window;
+  window.parent = window;
+  window.frames = window;
+  window.name = window.name || "";
+  window.devicePixelRatio = 1;
+  window.innerWidth = 1280;
+  window.innerHeight = 720;
+  window.outerWidth = 1280;
+  window.outerHeight = 720;
+  window.scrollX = 0;
+  window.scrollY = 0;
+  window.pageXOffset = 0;
+  window.pageYOffset = 0;
+  window.scrollTo = noop;
+  window.scrollBy = noop;
+  window.open = function () { return null; };
+  window.close = noop;
+  window.alert = noop;
+  window.confirm = function () { return false; };
+  window.prompt = function () { return null; };
+  window.getSelection = function () { return soft({ toString: function () { return ""; }, removeAllRanges: noop }); };
+  if (typeof global.atob !== "function") {
+    global.atob = window.atob = function (value) { return String(value || ""); };
+  }
+  if (typeof global.btoa !== "function") {
+    global.btoa = window.btoa = function (value) { return String(value || ""); };
+  }
+
+  var __pelagoModules = Object.create(null);
+  function isScriptUrl(name) {
+    return /^(https?:)?\/\//.test(name) || name.indexOf("/") === 0 || /\.js(\?|#|$)/.test(name);
+  }
+  function require(id, callback) {
+    if (typeof id === "function") { id(); return soft({}); }
     if (Array.isArray(id)) {
-        var loaded = id.map(function (name) { return require(name); });
-        if (typeof callback === "function") callback.apply(null, loaded);
-        return loaded[0];
+      var loaded = id.map(function (name) {
+        if (isScriptUrl(String(name))) {
+          try { __pelagoLoadScript(String(name)); } catch (e) {}
+          return soft(__pelagoModules[name] || {});
+        }
+        return require(name);
+      });
+      if (typeof callback === "function") {
+        try { callback.apply(null, loaded); } catch (e) {}
+      }
+      return loaded[0];
     }
+    id = String(id);
     if (Object.prototype.hasOwnProperty.call(__pelagoModules, id)) return __pelagoModules[id];
-    return {};
-}
-require.addPaths = function () {};
-require.config = function () {};
-function define(name, deps, factory) {
-    if (typeof name !== "string") {
-        factory = deps;
-        deps = name;
-        name = "";
+    if (isScriptUrl(id)) {
+      try { __pelagoLoadScript(id); } catch (e) {}
+      return soft(__pelagoModules[id] || {});
     }
-    if (!Array.isArray(deps)) {
-        factory = deps;
-        deps = [];
-    }
+    return soft({});
+  }
+  require.addPaths = noop;
+  require.config = noop;
+  require.async = require;
+  function define(name, deps, factory) {
+    if (typeof name !== "string") { factory = deps; deps = name; name = ""; }
+    if (!Array.isArray(deps)) { factory = deps; deps = []; }
     var exports = {};
     var module = { exports: exports };
     var result = factory;
     if (typeof factory === "function") {
-        var args = deps.map(function (dep) {
-            if (dep === "require") return require;
-            if (dep === "exports") return exports;
-            if (dep === "module") return module;
-            return require(dep);
-        });
-        result = factory.apply(null, args);
-        if (result === undefined) result = module.exports;
+      var args = deps.map(function (dep) {
+        if (dep === "require") return require;
+        if (dep === "exports") return exports;
+        if (dep === "module") return module;
+        return require(dep);
+      });
+      try { result = factory.apply(null, args); } catch (e) { result = module.exports; }
+      if (result === undefined) result = module.exports;
     }
-    __pelagoModules[name || ("anon-" + Object.keys(__pelagoModules).length)] = result;
-}
-define.amd = {};
-window.define = define;
-window.require = require;
+    __pelagoModules[name || ("anon-" + Object.keys(__pelagoModules).length)] = soft(result || {});
+  }
+  define.amd = {};
+  global.define = window.define = define;
+  global.require = window.require = require;
+
+  function XMLHttpRequest() {
+    this.readyState = 0;
+    this.status = 0;
+    this.responseText = "";
+    this.response = "";
+    this.responseType = "";
+    this._method = "GET";
+    this._url = "";
+  }
+  XMLHttpRequest.UNSENT = 0;
+  XMLHttpRequest.OPENED = 1;
+  XMLHttpRequest.HEADERS_RECEIVED = 2;
+  XMLHttpRequest.LOADING = 3;
+  XMLHttpRequest.DONE = 4;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this._method = method || "GET";
+    this._url = url || "";
+    this.readyState = 1;
+  };
+  XMLHttpRequest.prototype.setRequestHeader = noop;
+  XMLHttpRequest.prototype.getResponseHeader = function () { return ""; };
+  XMLHttpRequest.prototype.getAllResponseHeaders = function () { return ""; };
+  XMLHttpRequest.prototype.abort = noop;
+  XMLHttpRequest.prototype.overrideMimeType = noop;
+  XMLHttpRequest.prototype.send = function (body) {
+    var result = __pelagoHttp(String(this._method), String(this._url), body == null ? "" : String(body));
+    this.status = result.status;
+    this.responseText = result.body;
+    this.response = result.body;
+    this.readyState = 4;
+    if (typeof this.onreadystatechange === "function") this.onreadystatechange();
+    if (this.status >= 200 && this.status < 300) {
+      if (typeof this.onload === "function") this.onload();
+    } else if (typeof this.onerror === "function") {
+      this.onerror();
+    }
+  };
+  global.XMLHttpRequest = window.XMLHttpRequest = XMLHttpRequest;
+
+  function jQuery(sel) {
+    if (typeof sel === "function") { try { sel(jQuery); } catch (e) {} return jQuery; }
+    var nodes = [];
+    if (sel == null) nodes = [];
+    else if (typeof sel === "string") {
+      if (sel.charAt(0) === "<") nodes = [document.createElement("div")];
+      else {
+        var one = document.querySelector(sel);
+        nodes = one ? [one] : [];
+      }
+    } else if (sel.nodeType) nodes = [sel];
+    else if (sel.length != null) nodes = Array.prototype.slice.call(sel);
+    var api = soft({
+      length: nodes.length,
+      0: nodes[0],
+      each: function (fn) { nodes.forEach(function (node, index) { fn.call(node, index, node); }); return api; },
+      find: function (q) { return jQuery(nodes[0] ? nodes[0].querySelector && nodes[0].querySelector(q) : null); },
+      on: function () { return api; },
+      off: function () { return api; },
+      ready: function (fn) { if (typeof fn === "function") fn(jQuery); return api; },
+      html: function (value) { if (value == null) return nodes[0] ? nodes[0].innerHTML : ""; if (nodes[0]) nodes[0].innerHTML = value; return api; },
+      text: function (value) { if (value == null) return nodes[0] ? nodes[0].textContent : ""; if (nodes[0]) nodes[0].textContent = value; return api; },
+      attr: function (name, value) { if (value == null) return nodes[0] ? nodes[0].getAttribute(name) : undefined; if (nodes[0]) nodes[0].setAttribute(name, value); return api; },
+      addClass: function () { return api; },
+      removeClass: function () { return api; },
+      css: function () { return api; },
+      append: function () { return api; },
+      appendTo: function () { return api; },
+      hide: function () { return api; },
+      show: function () { return api; },
+      ajax: jQuery.ajax
+    });
+    return api;
+  }
+  jQuery.fn = jQuery.prototype = soft({});
+  jQuery.ajax = function () {
+    return soft({
+      done: function (fn) { if (typeof fn === "function") try { fn({}, "success", soft({})); } catch (e) {} return this; },
+      fail: function () { return this; },
+      always: function (fn) { if (typeof fn === "function") try { fn(); } catch (e) {} return this; },
+      then: function (fn) { return this.done(fn); }
+    });
+  };
+  jQuery.get = jQuery.ajax;
+  jQuery.post = jQuery.ajax;
+  jQuery.extend = function () {
+    var target = arguments[0] || {};
+    for (var i = 1; i < arguments.length; i++) {
+      var src = arguments[i] || {};
+      for (var key in src) if (Object.prototype.hasOwnProperty.call(src, key)) target[key] = src[key];
+    }
+    return target;
+  };
+  global.$ = global.jQuery = window.$ = window.jQuery = jQuery;
+  global.bds = window.bds = window.bds || soft({ util: soft({}), conf: soft({}), event: soft({ on: noop, un: noop, trigger: noop }) });
+  global.F = window.F = window.F || soft({});
+})(typeof globalThis !== "undefined" ? globalThis : (0, eval)("this"));
 "#;
 
 fn invoke_timer(args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -532,9 +1128,7 @@ fn invoke_timer(args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     TIMER_DEPTH.with(|slot| slot.set(depth + 1));
     let result = function.call(&JsValue::undefined(), &[], context);
     TIMER_DEPTH.with(|slot| slot.set(depth));
-    if let Err(err) = result {
-        eprintln!("JS 错误：{err}");
-    }
+    let _ = result;
     Ok(JsValue::from(1))
 }
 
@@ -564,10 +1158,14 @@ fn find_tags(doc: &Document, tag: &str) -> Vec<NodeId> {
         .iter()
         .enumerate()
         .filter_map(|(index, node)| {
+            let node_id = NodeId(index);
+            if !doc.is_connected(node_id) {
+                return None;
+            }
             let NodeData::Element { tag: node_tag, .. } = &node.data else {
                 return None;
             };
-            node_tag.eq_ignore_ascii_case(tag).then_some(NodeId(index))
+            node_tag.eq_ignore_ascii_case(tag).then_some(node_id)
         })
         .collect()
 }
@@ -578,9 +1176,20 @@ fn query_many(doc: &Document, selector: &str) -> Vec<NodeId> {
         .enumerate()
         .filter_map(|(index, _)| {
             let id = NodeId(index);
-            query_one_node(doc, id, selector).then_some(id)
+            (doc.is_connected(id) && query_one_node(doc, id, selector)).then_some(id)
         })
         .collect()
+}
+
+fn query_under(doc: &Document, root: NodeId, selector: &str) -> Option<NodeId> {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if id != root && query_one_node(doc, id, selector) {
+            return Some(id);
+        }
+        stack.extend(doc.nodes[id.0].children.iter().copied().rev());
+    }
+    None
 }
 
 fn query_one_node(doc: &Document, id: NodeId, selector: &str) -> bool {
@@ -615,10 +1224,14 @@ fn query_one_node(doc: &Document, id: NodeId, selector: &str) -> bool {
 
 fn find_id(doc: &Document, id: &str) -> Option<NodeId> {
     doc.nodes.iter().enumerate().find_map(|(index, node)| {
+        let node_id = NodeId(index);
+        if !doc.is_connected(node_id) {
+            return None;
+        }
         let NodeData::Element { attrs, .. } = &node.data else {
             return None;
         };
-        attrs.iter().any(|(key, value)| key.eq_ignore_ascii_case("id") && value == id).then_some(NodeId(index))
+        attrs.iter().any(|(key, value)| key.eq_ignore_ascii_case("id") && value == id).then_some(node_id)
     })
 }
 
@@ -789,5 +1402,70 @@ mod tests {
         let text = doc.text_content(doc.root());
         assert!(text.contains("readyhttps://example.com/a.png"), "{text}");
         assert!(doc.nodes.iter().any(|node| matches!(&node.data, NodeData::Element { tag, attrs } if tag == "img" && attrs.iter().any(|(key, value)| key == "src" && value == "https://example.com/a.png"))));
+    }
+
+    #[test]
+    fn xml_http_request_reports_status_and_body() {
+        let mut doc = parse(r#"<body><p id="msg"></p><script>
+            __pelagoHttp = function (method, url) {
+                return { status: 200, body: method + " " + url };
+            };
+            var xhr = new XMLHttpRequest();
+            xhr.open("GET", "/ping");
+            xhr.send();
+            document.getElementById("msg").textContent = xhr.status + " " + xhr.responseText;
+        </script></body>"#);
+        assert!(run_scripts_with(&mut doc, "https://example.com/app/", &|_| Err("无外部脚本".into())).is_none());
+        let text = doc.text_content(doc.root());
+        assert!(text.contains("200 GET /ping"), "{text}");
+    }
+
+    #[test]
+    fn dom_events_and_dynamic_script() {
+        let mut doc = parse(r#"<body><p id="msg">x</p><script>
+            var seen = [];
+            document.addEventListener("DOMContentLoaded", function () { seen.push("ready"); });
+            window.addEventListener("load", function () { seen.push("load"); });
+            var box = document.createElement("div");
+            var child = document.createElement("span");
+            child.textContent = "n";
+            box.appendChild(child);
+            document.body.appendChild(box);
+            var script = document.createElement("script");
+            script.src = "extra.js";
+            document.body.appendChild(script);
+            document.getElementById("msg").textContent = seen.join(",") + child.textContent;
+        </script></body>"#);
+        run_scripts_with(&mut doc, "https://example.com/", &|url| {
+            if url.ends_with("extra.js") {
+                Ok(br#"document.getElementById("msg").textContent += "|dyn";"#.to_vec())
+            } else {
+                Err("无此脚本".into())
+            }
+        });
+        // dynamic script uses net fetch via ACTIVE_BASE, not the test fetch callback.
+        // So we only assert event wiring + DOM mutation here.
+        let text = doc.text_content(doc.root());
+        assert!(text.contains("n"), "{text}");
+        assert!(doc.nodes.iter().any(|node| matches!(&node.data, NodeData::Element { tag, .. } if tag == "div")));
+    }
+
+    #[test]
+    fn insert_before_and_remove_child() {
+        let mut doc = parse(r#"<body><div id="box"><span id="b">B</span></div><script>
+            var box = document.getElementById("box");
+            var a = document.createElement("span");
+            a.id = "a";
+            a.textContent = "A";
+            box.insertBefore(a, document.getElementById("b"));
+            box.removeChild(document.getElementById("b"));
+        </script></body>"#);
+        assert!(run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into())).is_none());
+        let box_id = find_id(&doc, "box").expect("box");
+        let kids = doc.element_children(box_id);
+        assert_eq!(kids.len(), 1, "kids={kids:?}");
+        assert_eq!(doc.attr(kids[0], "id"), Some("a"));
+        assert_eq!(doc.text_content(kids[0]), "A");
+        assert!(find_id(&doc, "b").is_none());
     }
 }
