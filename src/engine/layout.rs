@@ -592,6 +592,21 @@ fn layout_block(
         });
         scene.fills.len() - 1
     });
+    let image_index = style.background_image.as_deref().and_then(|url| {
+        let resolved = resolve_url(flow.base_url, url)?;
+        let bitmap = flow.images.load(&resolved)?;
+        scene.images.push(ImageBox {
+            x: border_x,
+            y: top,
+            w: border_w,
+            h: 0.0,
+            pixel_width: bitmap.width,
+            pixel_height: bitmap.height,
+            rgba: bitmap.rgba,
+            href: flow.link.clone(),
+        });
+        Some(scene.images.len() - 1)
+    });
     if matches!(tag, "html" | "body") {
         if let Some(color) = style.background {
             if tag == "html" || scene.background_is_default {
@@ -647,6 +662,9 @@ fn layout_block(
     border_h = border_h.max(0.0);
     if let Some(index) = fill_index {
         scene.fills[index].h = border_h;
+    }
+    if let Some(index) = image_index {
+        scene.images[index].h = border_h;
     }
     scene.boxes.push(NodeBox {
         id,

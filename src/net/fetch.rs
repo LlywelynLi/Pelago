@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use encoding_rs::{Encoding, UTF_8};
 use ureq::Agent;
+use ureq::ResponseExt;
 
 const MAX_BODY: u64 = 2 * 1024 * 1024;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Pelago/0.1";
@@ -48,12 +49,13 @@ pub fn fetch(url: &str) -> Result<Page, FetchError> {
     }
     let html = decode_html(&response.bytes, response.content_type.as_deref());
     Ok(Page {
-        final_url: url.trim().to_string(),
+        final_url: response.final_url,
         html,
     })
 }
 
 pub struct BytesResponse {
+    pub final_url: String,
     pub content_type: Option<String>,
     pub bytes: Vec<u8>,
 }
@@ -151,6 +153,7 @@ pub fn fetch_bytes(url: &str, limit: u64) -> Result<BytesResponse, FetchError> {
         return Err(FetchError::Http(format!("HTTP {status}")));
     }
 
+    let final_url = response.get_uri().to_string();
     let content_type = response
         .headers()
         .get("content-type")
@@ -162,7 +165,11 @@ pub fn fetch_bytes(url: &str, limit: u64) -> Result<BytesResponse, FetchError> {
         .limit(limit)
         .read_to_vec()
         .map_err(|err| FetchError::Body(err.to_string()))?;
-    Ok(BytesResponse { content_type, bytes })
+    Ok(BytesResponse {
+        final_url,
+        content_type,
+        bytes,
+    })
 }
 
 pub fn decode_html(bytes: &[u8], content_type: Option<&str>) -> String {

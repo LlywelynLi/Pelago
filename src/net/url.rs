@@ -10,6 +10,9 @@ pub fn normalize_navigation(input: &str) -> Result<String, String> {
             return Ok(url.to_string());
         }
     }
+    if input.starts_with('/') {
+        return Err("相对地址需要当前页面才能解析".to_string());
+    }
     if let Some(rest) = input.strip_prefix("//") {
         return normalize_navigation(&format!("https://{rest}"));
     }
@@ -20,6 +23,7 @@ pub fn normalize_navigation(input: &str) -> Result<String, String> {
 
 pub fn resolve_url(base: Option<&str>, reference: &str) -> Option<String> {
     let reference = reference.trim();
+    let reference = empty_authority_path(reference).unwrap_or(reference);
     if reference.is_empty()
         || reference.starts_with('#')
         || reference.to_ascii_lowercase().starts_with("javascript:")
@@ -37,7 +41,22 @@ pub fn resolve_url(base: Option<&str>, reference: &str) -> Option<String> {
             }
         }
     }
+    if reference.starts_with('/') {
+        return None;
+    }
     normalize_navigation(reference).ok()
+}
+
+/// `https:///rp/a.css` 是漏掉主机后的路径，应回到 `/rp/a.css` 再相对页面解析。
+fn empty_authority_path(reference: &str) -> Option<&str> {
+    let rest = if reference.len() >= 8 && reference[..8].eq_ignore_ascii_case("https://") {
+        &reference[8..]
+    } else if reference.len() >= 7 && reference[..7].eq_ignore_ascii_case("http://") {
+        &reference[7..]
+    } else {
+        return None;
+    };
+    rest.starts_with('/').then_some(rest)
 }
 
 #[cfg(test)]
@@ -59,5 +78,15 @@ mod tests {
             Some("https://example.com/dir/pic.png")
         );
         assert!(resolve_url(Some("https://example.com/"), "#top").is_none());
+        assert_eq!(
+            resolve_url(Some("https://cn.bing.com/"), "/rp/a.gz.css").as_deref(),
+            Some("https://cn.bing.com/rp/a.gz.css")
+        );
+        assert_eq!(resolve_url(None, "/rp/a.gz.css").as_deref(), None);
+        assert_eq!(
+            resolve_url(Some("https://cn.bing.com/"), "https:///rp/a.gz.css").as_deref(),
+            Some("https://cn.bing.com/rp/a.gz.css")
+        );
+        assert!(normalize_navigation("/rp/a.gz.css").is_err());
     }
 }

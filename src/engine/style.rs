@@ -129,6 +129,7 @@ struct Declared {
     min_height: Option<Length>,
     max_height: Option<Length>,
     visibility_hidden: Option<bool>,
+    background_image: Option<Option<String>>,
     line_height: Option<Length>,
     box_sizing: Option<BoxSizing>,
     inset: Edges,
@@ -181,7 +182,7 @@ pub struct Viewport {
     pub height: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Computed {
     pub display: Display,
     pub color: Color,
@@ -207,6 +208,7 @@ pub struct Computed {
     pub min_height: Option<f32>,
     pub max_height: Option<f32>,
     pub visibility_hidden: bool,
+    pub background_image: Option<String>,
     pub line_height: f32,
     pub box_sizing: BoxSizing,
     pub top: Option<f32>,
@@ -348,6 +350,7 @@ pub fn root_style() -> Computed {
         min_height: None,
         max_height: None,
         visibility_hidden: false,
+        background_image: None,
         line_height: 22.4,
         box_sizing: BoxSizing::ContentBox,
         top: None,
@@ -422,6 +425,7 @@ impl Computed {
             min_height: None,
             max_height: None,
             visibility_hidden: self.visibility_hidden,
+            background_image: None,
             line_height: self.line_height,
             box_sizing: BoxSizing::ContentBox,
             top: None,
@@ -543,6 +547,9 @@ fn apply_declared(
     }
     if let Some(background) = declared.background {
         style.background = background;
+    }
+    if let Some(image) = &declared.background_image {
+        style.background_image = image.clone();
     }
     if let Some(display) = declared.display {
         style.display = display;
@@ -880,6 +887,33 @@ fn parse_declarations(block: &str) -> Declared {
     declared
 }
 
+fn css_image_url(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let mut rest = value[start + 4..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let body = if rest.starts_with('"') || rest.starts_with('\'') {
+        let quote = rest.chars().next()?;
+        rest = &rest[1..];
+        let end = rest.find(quote)?;
+        &rest[..end]
+    } else {
+        let end = rest.find(')')?;
+        rest[..end].trim()
+    };
+    let body = body.trim();
+    if body.is_empty() || body.to_ascii_lowercase().starts_with("data:") {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
 fn apply_declaration(declared: &mut Declared, name: &str, value: &str) {
     match name {
         "color" => {
@@ -887,11 +921,24 @@ fn apply_declaration(declared: &mut Declared, name: &str, value: &str) {
                 declared.color = Some(color);
             }
         }
-        "background" | "background-color" => {
+        "background-color" => {
             if value.eq_ignore_ascii_case("transparent") {
                 declared.background = Some(None);
             } else if let Some(color) = parse_color(value) {
                 declared.background = Some(Some(color));
+            }
+        }
+        "background-image" => {
+            declared.background_image = Some(css_image_url(value));
+        }
+        "background" => {
+            if value.eq_ignore_ascii_case("transparent") || value.eq_ignore_ascii_case("none") {
+                declared.background = Some(None);
+            } else if let Some(color) = parse_color(value) {
+                declared.background = Some(Some(color));
+            }
+            if value.to_ascii_lowercase().contains("url(") || value.eq_ignore_ascii_case("none") {
+                declared.background_image = Some(css_image_url(value));
             }
         }
         "font-size" => {
@@ -1233,6 +1280,25 @@ mod tests {
             _ => None,
         });
         compute("body", body.as_deref().unwrap_or(&[]), &[], &root_style(), &sheet, viewport, 800.0)
+    }
+
+    #[test]
+    fn background_image_url_and_none() {
+        let viewport = Viewport { width: 800.0, height: 600.0 };
+        let style = body_style(
+            r#"<style>body { height: 100vh; background-image: url("https://example.com/a.jpg"); }</style><body></body>"#,
+            viewport,
+        );
+        assert_eq!(style.background_image.as_deref(), Some("https://example.com/a.jpg"));
+        assert_eq!(style.height, Some(600.0));
+        let cleared = body_style(
+            r#"<style>
+                body { background-image: url("https://example.com/a.jpg"); }
+                body { background-image: none; }
+            </style><body></body>"#,
+            viewport,
+        );
+        assert!(cleared.background_image.is_none());
     }
 
     #[test]

@@ -1107,6 +1107,14 @@ const HOST_SHIM: &str = r#"
   global.setInterval = window.setInterval = function (cb, ms) { return queueTimer(cb, ms, true); };
   global.clearTimeout = window.clearTimeout = clearTimer;
   global.clearInterval = window.clearInterval = clearTimer;
+  global.setImmediate = window.setImmediate = function (cb) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return queueTimer(function () {
+      if (typeof cb === "function") cb.apply(null, args);
+      else if (typeof cb === "string") (0, eval)(cb);
+    }, 0, false);
+  };
+  global.clearImmediate = window.clearImmediate = clearTimer;
   global.__pelagoDrainTimers = function (budget) {
     budget = budget || 64;
     var ran = 0;
@@ -1171,9 +1179,18 @@ const HOST_SHIM: &str = r#"
       return new Proxy(obj, {
         get: function (target, prop, receiver) {
           if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
-          if (!(prop in target)) miss(label + "." + String(prop));
-          var got = Reflect.get(target, prop, receiver);
-          return typeof got === "function" ? got.bind(target) : got;
+          if (prop in target) {
+            var got = Reflect.get(target, prop, receiver);
+            return typeof got === "function" ? got.bind(target) : got;
+          }
+          // 顶层 var 在 Boa 里落在全局绑定上，浏览器里同时是 window 属性。
+          if (typeof prop === "string") {
+            try {
+              if (prop in global) return global[prop];
+            } catch (e) {}
+          }
+          miss(label + "." + String(prop));
+          return undefined;
         },
         set: function (target, prop, next) {
           try { target[prop] = next; } catch (e) {}
@@ -1258,8 +1275,40 @@ const HOST_SHIM: &str = r#"
   installTarget(document);
   installTarget(window);
 
-  function Image() { return wrapNode(document.createElement("img")); }
+  function Image() {
+    var el = wrapNode(document.createElement("img"));
+    var src = "";
+    try {
+      Object.defineProperty(el, "src", {
+        configurable: true,
+        get: function () { return src; },
+        set: function (value) {
+          src = String(value || "");
+          try { el.setAttribute("src", src); } catch (e) {}
+          setTimeout(function () {
+            var lower = src.toLowerCase();
+            var unsupported = lower.indexOf("image/avif") >= 0 || /\.avif(\?|#|$)/.test(lower);
+            if (unsupported) {
+              if (typeof el.onerror === "function") el.onerror();
+            } else if (typeof el.onload === "function") {
+              el.onload();
+            }
+          }, 0);
+        }
+      });
+    } catch (e) {}
+    return el;
+  }
   global.Image = window.Image = Image;
+  global.indexedDB = window.indexedDB = {
+    open: function () {
+      var req = { result: null, error: { name: "UnknownError" } };
+      setTimeout(function () {
+        if (typeof req.onerror === "function") req.onerror();
+      }, 0);
+      return req;
+    }
+  };
 
   function Event(type, init) {
     this.type = String(type || "");
@@ -1290,13 +1339,20 @@ const HOST_SHIM: &str = r#"
   Storage.prototype.removeItem = function (key) { delete this._data[key]; };
   Storage.prototype.clear = function () { this._data = Object.create(null); };
   Storage.prototype.key = function (index) { return Object.keys(this._data)[index] || null; };
-  global.localStorage = window.localStorage = soft(new Storage());
-  global.sessionStorage = window.sessionStorage = soft(new Storage());
+  global.localStorage = window.localStorage = new Storage();
+  global.sessionStorage = window.sessionStorage = new Storage();
   global.history = window.history = soft({ pushState: noop, replaceState: noop, back: noop, forward: noop, go: noop, length: 1, state: null });
   global.screen = window.screen = soft({ width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24, pixelDepth: 24 });
   var __navStart = Date.now() - 120;
   global.performance = window.performance = soft({
     now: function () { return Date.now() - __navStart; },
+    mark: noop,
+    measure: noop,
+    clearMarks: noop,
+    clearMeasures: noop,
+    getEntries: function () { return []; },
+    getEntriesByType: function () { return []; },
+    getEntriesByName: function () { return []; },
     timing: {
       navigationStart: __navStart,
       fetchStart: __navStart + 10,
@@ -2280,7 +2336,9 @@ fn node_box(doc: *mut Document, id: NodeId) -> (f32, f32, f32, f32) {
     }
     let mut fonts = cosmic_text::FontSystem::new();
     let mut images = ImageStore::new();
-    let scene = unsafe { layout::layout(&*doc, 1280.0, 720.0, None, &mut images, &mut fonts) };
+    let base = ACTIVE_BASE.with(|slot| slot.borrow().clone());
+    let base_ref = if base.is_empty() { None } else { Some(base.as_str()) };
+    let scene = unsafe { layout::layout(&*doc, 1280.0, 720.0, base_ref, &mut images, &mut fonts) };
     let mut boxes = HashMap::new();
     for NodeBox { id, x, y, w, h, scroll_w, scroll_h } in scene.boxes {
         boxes.insert(
@@ -2730,6 +2788,45 @@ mod tests {
         let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
         assert!(result.failures >= 1, "samples={:?}", result.samples);
         assert_eq!(doc.text_content(find_id(&doc, "msg").unwrap()), "object");
+    }
+
+    #[test]
+    fn window_sees_top_level_vars_and_set_immediate() {
+        let mut doc = parse(
+            r#"<body>
+            <script>
+            var forceNoIOTD = false;
+            var isIotdEnabled = 0;
+            var perf = { ok: 1 };
+            localStorage.eventLogQueue_Offline = "[]";
+            performance.mark("AutosuggestJSBundleLoaded");
+            setImmediate(function () { document.body.setAttribute("data-ran", "1"); });
+            document.body.setAttribute("data-f", String(window.forceNoIOTD));
+            document.body.setAttribute("data-i", String(window.isIotdEnabled));
+            document.body.setAttribute("data-p", String(window.perf && window.perf.ok));
+            document.body.setAttribute("data-q", localStorage.eventLogQueue_Offline);
+            </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://cn.bing.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        let body = find_tag(&doc, "body").expect("body");
+        assert_eq!(doc.attr(body, "data-f"), Some("false"));
+        assert_eq!(doc.attr(body, "data-i"), Some("0"));
+        assert_eq!(doc.attr(body, "data-p"), Some("1"));
+        assert_eq!(doc.attr(body, "data-q"), Some("[]"));
+        assert_eq!(doc.attr(body, "data-ran"), Some("1"));
+        assert!(
+            !result.api_misses.iter().any(|(name, _)| {
+                name.ends_with("forceNoIOTD")
+                    || name.ends_with("isIotdEnabled")
+                    || name.ends_with("setImmediate")
+                    || name.ends_with("perf")
+                    || name.contains("eventLogQueue_Offline")
+                    || name.ends_with(".mark")
+            }),
+            "misses={:?}",
+            result.api_misses
+        );
     }
 
     #[test]

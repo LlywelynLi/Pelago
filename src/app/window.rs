@@ -197,9 +197,10 @@ impl App {
                 return;
             }
         };
-        self.document = Some(load_document(&url));
-        self.current_url = Some(url.clone());
-        self.address = url.clone();
+        let (document, final_url) = load_document(&url);
+        self.document = Some(document);
+        self.current_url = Some(final_url.clone());
+        self.address = final_url.clone();
         self.address_focused = false;
         self.scene = None;
         self.scroll = 0.0;
@@ -207,19 +208,19 @@ impl App {
             if self.history_index + 1 < self.history.len() {
                 self.history.truncate(self.history_index + 1);
             }
-            self.history.push(url.clone());
+            self.history.push(final_url.clone());
             self.history_index = self.history.len() - 1;
         }
 
         let navigation = self
             .document
             .as_mut()
-            .map(|doc| js::run_inline_scripts(doc, &url).navigation)
+            .map(|doc| js::run_inline_scripts(doc, &final_url).navigation)
             .flatten();
         let Some(nav) = navigation else {
             return;
         };
-        if nav.url == url || redirects_left == 0 {
+        if nav.url == final_url || redirects_left == 0 {
             return;
         }
         match nav.kind {
@@ -360,15 +361,15 @@ impl App {
     }
 }
 
-fn load_document(url: &str) -> Document {
+fn load_document(url: &str) -> (Document, String) {
     match fetch(url) {
         Ok(page) => {
             eprintln!("{}", page.final_url);
-            parse(&page.html)
+            (parse(&page.html), page.final_url)
         }
         Err(err) => {
             eprintln!("{err}");
-            error_document(&err.to_string())
+            (error_document(&err.to_string()), url.to_string())
         }
     }
 }
