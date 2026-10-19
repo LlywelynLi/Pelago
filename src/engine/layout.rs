@@ -2,7 +2,7 @@ use cosmic_text::{Align, Attrs, Buffer, Color, FontSystem, Metrics, Shaping, Und
 
 use crate::engine::dom::{Document, NodeData, NodeId};
 use crate::engine::image::{Bitmap, ImageStore};
-use crate::engine::style::{self, Computed, Display, ElemSnap, FlexDirection, FloatSide, Justify, Position, Stylesheet, TextAlign, Track, Viewport};
+use crate::engine::style::{self, BoxSizing, Computed, Display, ElemSnap, FlexDirection, FloatSide, Justify, Overflow, Position, Stylesheet, TextAlign, Track, Viewport};
 use crate::net::url::resolve_url;
 
 const LINE_SCALE: f32 = 1.4;
@@ -39,6 +39,16 @@ pub struct ImageBox {
     pub href: Option<String>,
 }
 
+pub struct NodeBox {
+    pub id: NodeId,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub scroll_w: f32,
+    pub scroll_h: f32,
+}
+
 pub struct Scene {
     pub background: Color,
     background_is_default: bool,
@@ -46,6 +56,7 @@ pub struct Scene {
     pub fills: Vec<Fill>,
     pub texts: Vec<TextBox>,
     pub images: Vec<ImageBox>,
+    pub boxes: Vec<NodeBox>,
 }
 
 impl Scene {
@@ -88,6 +99,7 @@ pub fn layout(
         fills: Vec::new(),
         texts: Vec::new(),
         images: Vec::new(),
+        boxes: Vec::new(),
     };
     let mut flow = Flow {
         base_url,
@@ -454,6 +466,28 @@ fn walk(
                 match style.display {
                     Display::None => {}
                     Display::Inline | Display::InlineBlock => {
+                        if matches!(tag.as_str(), "input" | "textarea" | "button" | "select") {
+                            y = inline.finish(x, y, width, parent_style.text_align, flow.link.clone(), font_system, scene);
+                            let pref = style.width.unwrap_or(if tag == "textarea" { 240.0 } else { 160.0 }).clamp(1.0, width);
+                            y = layout_block(
+                                doc,
+                                child,
+                                &tag,
+                                &attrs,
+                                &style,
+                                x,
+                                y,
+                                pref,
+                                preserve,
+                                sheet,
+                                viewport,
+                                scene,
+                                font_system,
+                                flow,
+                                ancestors,
+                            );
+                            continue;
+                        }
                         y = walk(
                             doc,
                             child,
@@ -478,14 +512,19 @@ fn walk(
                             flow.float_x = x;
                             flow.float_origin_y = -1.0;
                         }
-                        y = layout_block(
+                        let (shift_x, shift_y) = if style.position == Position::Relative {
+                            (style.left.unwrap_or(0.0), style.top.unwrap_or(0.0))
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let bottom = layout_block(
                             doc,
                             child,
                             &tag,
                             &attrs,
                             &style,
-                            x,
-                            y,
+                            x + shift_x,
+                            y + shift_y,
                             width,
                             preserve,
                             sheet,
@@ -495,6 +534,7 @@ fn walk(
                             flow,
                             ancestors,
                         );
+                        y = bottom - shift_y;
                     }
                 }
             }
@@ -523,7 +563,21 @@ fn layout_block(
     let [mt, mr, mb, ml] = style.margin;
     let [pt, pr, pb, pl] = style.padding;
     let border_x = x + ml;
-    let border_w = (available_width - ml - mr).max(1.0);
+    let mut border_w = if let Some(width) = style.width {
+        match style.box_sizing {
+            BoxSizing::BorderBox => width,
+            BoxSizing::ContentBox => width + pl + pr,
+        }
+    } else {
+        (available_width - ml - mr).max(1.0)
+    };
+    if let Some(max) = style.max_width {
+        border_w = border_w.min(max);
+    }
+    if let Some(min) = style.min_width {
+        border_w = border_w.max(min);
+    }
+    border_w = border_w.max(1.0);
     let content_x = border_x + pl;
     let content_w = (border_w - pl - pr).max(1.0);
     let top = y + mt;
@@ -566,11 +620,44 @@ fn layout_block(
         ancestors,
     );
     ancestors.pop();
-    let border_bottom = content_bottom + pb;
-    if let Some(index) = fill_index {
-        scene.fills[index].h = (border_bottom - top).max(0.0);
+    let content_h = (content_bottom - content_y).max(0.0);
+    let mut border_h = content_h + pt + pb;
+    let mut scroll_h = border_h;
+    if let Some(height) = style.height {
+        let specified = match style.box_sizing {
+            BoxSizing::BorderBox => height,
+            BoxSizing::ContentBox => height + pt + pb,
+        };
+        scroll_h = border_h.max(specified);
+        border_h = match style.overflow {
+            Overflow::Visible => border_h.max(specified),
+            Overflow::Hidden | Overflow::Scroll => specified,
+        };
     }
-    border_bottom + mb
+    if let Some(max) = style.max_height {
+        if border_h > max {
+            scroll_h = scroll_h.max(border_h);
+            border_h = max;
+        }
+    }
+    if let Some(min) = style.min_height {
+        border_h = border_h.max(min);
+        scroll_h = scroll_h.max(border_h);
+    }
+    border_h = border_h.max(0.0);
+    if let Some(index) = fill_index {
+        scene.fills[index].h = border_h;
+    }
+    scene.boxes.push(NodeBox {
+        id,
+        x: border_x,
+        y: top,
+        w: border_w,
+        h: border_h,
+        scroll_w: border_w.max(content_w),
+        scroll_h: scroll_h.max(border_h),
+    });
+    top + border_h + mb
 }
 
 fn place_image(x: f32, y: f32, width: f32, attrs: &[(String, String)], style: &Computed, scene: &mut Scene, flow: &mut Flow<'_>) -> f32 {

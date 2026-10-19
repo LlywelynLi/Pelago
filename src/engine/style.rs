@@ -45,7 +45,21 @@ pub enum FloatSide {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Position {
     Static,
+    Relative,
     Absolute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overflow {
+    Visible,
+    Hidden,
+    Scroll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxSizing {
+    ContentBox,
+    BorderBox,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +121,16 @@ struct Declared {
     flex_grow: Option<f32>,
     float: Option<FloatSide>,
     position: Option<Position>,
+    overflow: Option<Overflow>,
+    opacity: Option<f32>,
+    z_index: Option<i32>,
+    min_width: Option<Length>,
+    max_width: Option<Length>,
+    min_height: Option<Length>,
+    max_height: Option<Length>,
+    visibility_hidden: Option<bool>,
+    line_height: Option<Length>,
+    box_sizing: Option<BoxSizing>,
     inset: Edges,
     grid_columns: Option<[Option<Track>; 6]>,
     grid_column_count: Option<u8>,
@@ -175,6 +199,16 @@ pub struct Computed {
     pub flex_grow: f32,
     pub float: FloatSide,
     pub position: Position,
+    pub overflow: Overflow,
+    pub opacity: f32,
+    pub z_index: Option<i32>,
+    pub min_width: Option<f32>,
+    pub max_width: Option<f32>,
+    pub min_height: Option<f32>,
+    pub max_height: Option<f32>,
+    pub visibility_hidden: bool,
+    pub line_height: f32,
+    pub box_sizing: BoxSizing,
     pub top: Option<f32>,
     pub right: Option<f32>,
     pub bottom: Option<f32>,
@@ -306,6 +340,16 @@ pub fn root_style() -> Computed {
         flex_grow: 0.0,
         float: FloatSide::None,
         position: Position::Static,
+        overflow: Overflow::Visible,
+        opacity: 1.0,
+        z_index: None,
+        min_width: None,
+        max_width: None,
+        min_height: None,
+        max_height: None,
+        visibility_hidden: false,
+        line_height: 22.4,
+        box_sizing: BoxSizing::ContentBox,
         top: None,
         right: None,
         bottom: None,
@@ -352,7 +396,7 @@ pub fn compute(
 }
 
 impl Computed {
-    fn inherited(&self) -> Self {
+    pub fn inherited(&self) -> Self {
         Self {
             display: Display::Inline,
             color: self.color,
@@ -370,6 +414,16 @@ impl Computed {
             flex_grow: 0.0,
             float: FloatSide::None,
             position: Position::Static,
+            overflow: Overflow::Visible,
+            opacity: self.opacity,
+            z_index: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
+            visibility_hidden: self.visibility_hidden,
+            line_height: self.line_height,
+            box_sizing: BoxSizing::ContentBox,
             top: None,
             right: None,
             bottom: None,
@@ -520,6 +574,37 @@ fn apply_declared(
     if let Some(position) = declared.position {
         style.position = position;
     }
+    if let Some(overflow) = declared.overflow {
+        style.overflow = overflow;
+    }
+    if let Some(opacity) = declared.opacity {
+        style.opacity = opacity.clamp(0.0, 1.0);
+    }
+    if let Some(z_index) = declared.z_index {
+        style.z_index = Some(z_index);
+    }
+    if let Some(hidden) = declared.visibility_hidden {
+        style.visibility_hidden = hidden;
+    }
+    if let Some(sizing) = declared.box_sizing {
+        style.box_sizing = sizing;
+    }
+    style.min_width = declared
+        .min_width
+        .and_then(|length| resolve_used_length(length, style.font_size, viewport, containing_width))
+        .or(style.min_width);
+    style.max_width = declared
+        .max_width
+        .and_then(|length| resolve_used_length(length, style.font_size, viewport, containing_width))
+        .or(style.max_width);
+    style.min_height = declared
+        .min_height
+        .and_then(|length| resolve_used_length(length, style.font_size, viewport, viewport.height))
+        .or(style.min_height);
+    style.max_height = declared
+        .max_height
+        .and_then(|length| resolve_used_length(length, style.font_size, viewport, viewport.height))
+        .or(style.max_height);
     style.top = declared.inset.top.and_then(|length| resolve_used_length(length, style.font_size, viewport, viewport.height)).or(style.top);
     style.right = declared.inset.right.and_then(|length| resolve_used_length(length, style.font_size, viewport, containing_width)).or(style.right);
     style.bottom = declared.inset.bottom.and_then(|length| resolve_used_length(length, style.font_size, viewport, viewport.height)).or(style.bottom);
@@ -533,6 +618,12 @@ fn apply_declared(
     }
     if let Some(font_size) = declared.font_size {
         style.font_size = resolve_font_size(font_size, parent_font).max(1.0);
+        if declared.line_height.is_none() {
+            style.line_height = style.font_size * 1.4;
+        }
+    }
+    if let Some(line) = declared.line_height {
+        style.line_height = resolve_used_length(line, style.font_size, viewport, containing_width).unwrap_or(style.line_height);
     }
     resolve_edge(&declared.margin.top, &mut style.margin[0], style.font_size, viewport, containing_width, false);
     resolve_edge(&declared.margin.right, &mut style.margin[1], style.font_size, viewport, containing_width, false);
@@ -877,7 +968,35 @@ fn apply_declaration(declared: &mut Declared, name: &str, value: &str) {
         "position" => {
             declared.position = match value.to_ascii_lowercase().as_str() {
                 "absolute" | "fixed" => Some(Position::Absolute),
-                "static" | "relative" | "sticky" => Some(Position::Static),
+                "relative" | "sticky" => Some(Position::Relative),
+                "static" => Some(Position::Static),
+                _ => None,
+            };
+        }
+        "overflow" | "overflow-y" | "overflow-x" => {
+            declared.overflow = match value.to_ascii_lowercase().as_str() {
+                "hidden" => Some(Overflow::Hidden),
+                "scroll" | "auto" => Some(Overflow::Scroll),
+                "visible" => Some(Overflow::Visible),
+                _ => None,
+            };
+        }
+        "opacity" => declared.opacity = value.trim().parse::<f32>().ok(),
+        "z-index" => declared.z_index = value.trim().parse().ok(),
+        "min-width" => declared.min_width = parse_length(value),
+        "max-width" => declared.max_width = parse_length(value),
+        "min-height" => declared.min_height = parse_length(value),
+        "max-height" => declared.max_height = parse_length(value),
+        "visibility" => {
+            declared.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden") || value.eq_ignore_ascii_case("collapse"));
+        }
+        "line-height" => {
+            declared.line_height = parse_length(value).or_else(|| value.trim().parse::<f32>().ok().map(Length::Em));
+        }
+        "box-sizing" => {
+            declared.box_sizing = match value.to_ascii_lowercase().as_str() {
+                "border-box" => Some(BoxSizing::BorderBox),
+                "content-box" => Some(BoxSizing::ContentBox),
                 _ => None,
             };
         }

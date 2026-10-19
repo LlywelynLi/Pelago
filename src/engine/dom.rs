@@ -24,6 +24,8 @@ pub struct Node {
 #[derive(Debug)]
 pub struct Document {
     pub nodes: Vec<Node>,
+    /// DOM 变更计数，供布局几何缓存失效。
+    pub generation: u64,
 }
 
 impl Document {
@@ -34,7 +36,12 @@ impl Document {
                 parent: None,
                 children: Vec::new(),
             }],
+            generation: 0,
         }
+    }
+
+    pub fn bump(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn root(&self) -> NodeId {
@@ -49,6 +56,7 @@ impl Document {
             children: Vec::new(),
         });
         self.nodes[parent.0].children.push(id);
+        self.bump();
         id
     }
 
@@ -63,6 +71,13 @@ impl Document {
     }
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        if self.is_fragment(child) {
+            let children = self.nodes[child.0].children.clone();
+            for node in children {
+                self.append_child(parent, node);
+            }
+            return;
+        }
         if parent.0 >= self.nodes.len() || child.0 >= self.nodes.len() || parent == child {
             return;
         }
@@ -71,9 +86,17 @@ impl Document {
         }
         self.nodes[child.0].parent = Some(parent);
         self.nodes[parent.0].children.push(child);
+        self.bump();
     }
 
     pub fn insert_before(&mut self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
+        if self.is_fragment(child) {
+            let children = self.nodes[child.0].children.clone();
+            for node in children {
+                self.insert_before(parent, node, before);
+            }
+            return;
+        }
         if parent.0 >= self.nodes.len() || child.0 >= self.nodes.len() || parent == child {
             return;
         }
@@ -81,14 +104,33 @@ impl Document {
             self.nodes[old.0].children.retain(|id| *id != child);
         }
         self.nodes[child.0].parent = Some(parent);
-        let children = &mut self.nodes[parent.0].children;
-        if let Some(before) = before {
-            if let Some(index) = children.iter().position(|id| *id == before) {
-                children.insert(index, child);
-                return;
+        let inserted = {
+            let children = &mut self.nodes[parent.0].children;
+            if let Some(before) = before {
+                if let Some(index) = children.iter().position(|id| *id == before) {
+                    children.insert(index, child);
+                    true
+                } else {
+                    children.push(child);
+                    true
+                }
+            } else {
+                children.push(child);
+                true
             }
+        };
+        if inserted {
+            self.bump();
         }
-        children.push(child);
+    }
+
+    pub fn replace_child(&mut self, parent: NodeId, new_child: NodeId, old_child: NodeId) {
+        self.insert_before(parent, new_child, Some(old_child));
+        self.remove_child(parent, old_child);
+    }
+
+    pub fn is_fragment(&self, id: NodeId) -> bool {
+        self.tag_name(id).is_some_and(|tag| tag == "#document-fragment")
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
@@ -99,6 +141,7 @@ impl Document {
         if self.nodes[child.0].parent == Some(parent) {
             self.nodes[child.0].parent = None;
         }
+        self.bump();
     }
 
     pub fn remove(&mut self, id: NodeId) {
@@ -112,6 +155,7 @@ impl Document {
         for child in children {
             self.nodes[child.0].parent = None;
         }
+        self.bump();
     }
 
     pub fn clone_node(&mut self, id: NodeId, deep: bool) -> Option<NodeId> {
@@ -143,6 +187,7 @@ impl Document {
             return;
         };
         attrs.retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        self.bump();
     }
 
     pub fn has_attr(&self, id: NodeId, name: &str) -> bool {
@@ -209,6 +254,7 @@ impl Document {
         } else {
             attrs.push((name.to_string(), value));
         }
+        self.bump();
     }
 
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {

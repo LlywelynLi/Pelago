@@ -8,6 +8,9 @@ use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsArgs, JsResult, JsString, JsValue, NativeFunction, Source};
 
 use crate::engine::dom::{Document, NodeData, NodeId};
+use crate::engine::image::ImageStore;
+use crate::engine::layout::{self, NodeBox};
+use crate::engine::style::{self, Display, ElemSnap, Overflow, Position, TextAlign, Viewport};
 use crate::net::url::{normalize_navigation, resolve_url};
 
 thread_local! {
@@ -17,6 +20,24 @@ thread_local! {
     static SCRIPT_FAILURES: Cell<u32> = const { Cell::new(0) };
     static SCRIPT_SAMPLES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static API_MISSES: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    static BOX_CACHE: RefCell<Option<BoxCache>> = const { RefCell::new(None) };
+    static SCROLL_OFFSETS: RefCell<HashMap<(usize, usize), (f32, f32)>> = RefCell::new(HashMap::new());
+}
+
+struct LaidBox {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    scroll_w: f32,
+    scroll_h: f32,
+}
+
+struct BoxCache {
+    doc: usize,
+    generation: u64,
+    page_height: f32,
+    boxes: HashMap<usize, LaidBox>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -615,6 +636,36 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         unsafe { set_inner_html(&mut *doc, node, &value.to_std_string_escaped()) };
         Ok(JsValue::undefined())
     });
+    let get_outer = NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let html = unsafe { serialize_node_string(&*doc, node) };
+        Ok(JsValue::from(JsString::from(html.as_str())))
+    });
+    let set_outer = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let value = args.get_or_undefined(0).to_string(context)?;
+        unsafe { set_outer_html(&mut *doc, node, &value.to_std_string_escaped()) };
+        Ok(JsValue::undefined())
+    });
+    let get_value = NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let value = unsafe { control_value(&*doc, node) };
+        Ok(JsValue::from(JsString::from(value.as_str())))
+    });
+    let set_value = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let value = args.get_or_undefined(0).to_string(context)?;
+        unsafe { set_control_value(&mut *doc, node, &value.to_std_string_escaped()) };
+        Ok(JsValue::undefined())
+    });
     let append_child = NativeFunction::from_copy_closure(move |this, args, context| {
         let Some(parent) = node_id(this, context)? else {
             return Ok(JsValue::undefined());
@@ -646,6 +697,20 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
             return Ok(JsValue::undefined());
         };
         unsafe { (*doc).remove_child(parent, child) };
+        Ok(args.get_or_undefined(0).clone())
+    });
+    let replace_child = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(parent) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let Some(new_child) = node_id(&args.get_or_undefined(0).clone(), context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let Some(old_child) = node_id(&args.get_or_undefined(1).clone(), context)? else {
+            return Ok(JsValue::undefined());
+        };
+        unsafe { (*doc).replace_child(parent, new_child, old_child) };
+        maybe_run_script_node(doc, new_child);
         Ok(args.get_or_undefined(0).clone())
     });
     let remove_self = NativeFunction::from_copy_closure(move |this, _, context| {
@@ -703,6 +768,10 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
     let set_class = set_class.to_js_function(context.realm());
     let get_html = get_html.to_js_function(context.realm());
     let set_html = set_html.to_js_function(context.realm());
+    let get_outer = get_outer.to_js_function(context.realm());
+    let set_outer = set_outer.to_js_function(context.realm());
+    let get_value = get_value.to_js_function(context.realm());
+    let set_value = set_value.to_js_function(context.realm());
     let get_parent_fn = get_parent.to_js_function(context.realm());
     let get_children_fn = get_children.to_js_function(context.realm());
     let (get_src, set_src) = attr_accessor(doc, "src", context);
@@ -729,6 +798,17 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         let class = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
         Ok(JsValue::from(unsafe { class_list_contains(&*doc, id, &class) }))
     });
+    let offset_width = metric_getter(doc, Metric::Width).to_js_function(context.realm());
+    let offset_height = metric_getter(doc, Metric::Height).to_js_function(context.realm());
+    let client_width = metric_getter(doc, Metric::Width).to_js_function(context.realm());
+    let client_height = metric_getter(doc, Metric::Height).to_js_function(context.realm());
+    let scroll_width = metric_getter(doc, Metric::ScrollWidth).to_js_function(context.realm());
+    let scroll_height = metric_getter(doc, Metric::ScrollHeight).to_js_function(context.realm());
+    let scroll_left = scroll_getter(doc, true).to_js_function(context.realm());
+    let set_scroll_left = scroll_setter(doc, true).to_js_function(context.realm());
+    let scroll_top = scroll_getter(doc, false).to_js_function(context.realm());
+    let set_scroll_top = scroll_setter(doc, false).to_js_function(context.realm());
+    let scroll_to = scroll_to_fn(doc);
     let class_list = ObjectInitializer::new(context)
         .function(class_add, js_string!("add"), 1)
         .function(class_remove, js_string!("remove"), 1)
@@ -740,6 +820,8 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         .accessor(js_string!("textContent"), Some(get_text), Some(set_text), Attribute::all())
         .accessor(js_string!("className"), Some(get_class), Some(set_class), Attribute::all())
         .accessor(js_string!("innerHTML"), Some(get_html), Some(set_html), Attribute::all())
+        .accessor(js_string!("outerHTML"), Some(get_outer), Some(set_outer), Attribute::all())
+        .accessor(js_string!("value"), Some(get_value), Some(set_value), Attribute::all())
         .accessor(js_string!("src"), Some(get_src), Some(set_src), Attribute::all())
         .accessor(js_string!("id"), Some(get_id), Some(set_id), Attribute::all())
         .accessor(js_string!("href"), Some(get_href), Some(set_href), Attribute::all())
@@ -748,6 +830,7 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         .function(append_child, js_string!("appendChild"), 1)
         .function(insert_before, js_string!("insertBefore"), 2)
         .function(remove_child, js_string!("removeChild"), 1)
+        .function(replace_child, js_string!("replaceChild"), 2)
         .function(remove_self, js_string!("remove"), 0)
         .function(clone_node, js_string!("cloneNode"), 1)
         .function(query_one_local, js_string!("querySelector"), 1)
@@ -772,6 +855,26 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         .function(noop(), js_string!("focus"), 0)
         .function(noop(), js_string!("blur"), 0)
         .function(noop(), js_string!("click"), 0)
+        .function(
+            NativeFunction::from_copy_closure(move |this, _, context| {
+                let Some(node) = node_id(this, context)? else {
+                    return rect_value(0.0, 0.0, 0.0, 0.0, context);
+                };
+                let (x, y, w, h) = node_box(doc, node);
+                rect_value(x, y, w, h, context)
+            }),
+            js_string!("getBoundingClientRect"),
+            0,
+        )
+        .accessor(js_string!("offsetWidth"), Some(offset_width), None, Attribute::all())
+        .accessor(js_string!("offsetHeight"), Some(offset_height), None, Attribute::all())
+        .accessor(js_string!("clientWidth"), Some(client_width), None, Attribute::all())
+        .accessor(js_string!("clientHeight"), Some(client_height), None, Attribute::all())
+        .accessor(js_string!("scrollWidth"), Some(scroll_width), None, Attribute::all())
+        .accessor(js_string!("scrollHeight"), Some(scroll_height), None, Attribute::all())
+        .accessor(js_string!("scrollLeft"), Some(scroll_left), Some(set_scroll_left), Attribute::all())
+        .accessor(js_string!("scrollTop"), Some(scroll_top), Some(set_scroll_top), Attribute::all())
+        .function(scroll_to, js_string!("scrollTo"), 2)
         .function(
             NativeFunction::from_copy_closure(move |this, args, context| {
                 let Some(parent) = node_id(this, context)? else {
@@ -835,7 +938,20 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         .property(js_string!("style"), style_obj, Attribute::all())
         .property(js_string!("classList"), class_list, Attribute::all())
         .build();
+    let _ = bind_element_extras(&object, context);
     Ok(JsValue::from(object))
+}
+
+fn bind_element_extras(object: &boa_engine::object::JsObject, context: &mut Context) -> JsResult<()> {
+    let Some(binder) = context
+        .global_object()
+        .get(js_string!("__pelagoBindExtras"), context)?
+        .as_callable()
+    else {
+        return Ok(());
+    };
+    let _ = binder.call(&JsValue::undefined(), &[JsValue::from(object.clone())], context);
+    Ok(())
 }
 
 fn attr_accessor(doc: *mut Document, name: &'static str, context: &mut Context) -> (boa_engine::object::builtins::JsFunction, boa_engine::object::builtins::JsFunction) {
@@ -892,6 +1008,25 @@ fn install_host(context: &mut Context, base_url: &str) -> JsResult<()> {
         note_api_miss(&name);
         Ok(JsValue::undefined())
     });
+    let computed_style_fn = NativeFunction::from_copy_closure(|_, args, context| {
+        let Some(node) = node_id(&args.get_or_undefined(0).clone(), context)? else {
+            return style_value(&ComputedStyle::empty(), context);
+        };
+        let style = ACTIVE_DOC.with(|slot| {
+            let ptr = slot.get();
+            if ptr.is_null() {
+                ComputedStyle::empty()
+            } else {
+                unsafe { computed_style(&*ptr, node) }
+            }
+        });
+        style_value(&style, context)
+    });
+    context.register_global_property(
+        js_string!("getComputedStyle"),
+        computed_style_fn.to_js_function(context.realm()),
+        Attribute::all(),
+    )?;
     context.register_global_property(js_string!("console"), console.clone(), Attribute::all())?;
     context.register_global_property(js_string!("navigator"), navigator.clone(), Attribute::all())?;
     // 定时器由 HOST_SHIM 实现队列；这里先占位，随后被 shim 覆盖。
@@ -939,6 +1074,12 @@ fn install_host(context: &mut Context, base_url: &str) -> JsResult<()> {
         window.set(js_string!("console"), console, false, context)?;
         window.set(js_string!("navigator"), navigator, false, context)?;
         window.set(js_string!("document"), context.global_object().get(js_string!("document"), context)?, false, context)?;
+        window.set(
+            js_string!("getComputedStyle"),
+            context.global_object().get(js_string!("getComputedStyle"), context)?,
+            false,
+            context,
+        )?;
     }
     context.eval(Source::from_bytes(HOST_SHIM))?;
     Ok(())
@@ -988,7 +1129,7 @@ const HOST_SHIM: &str = r#"
   function soft(value, label) {
     if (value == null || (typeof value !== "object" && typeof value !== "function")) return value;
     try {
-      if (value.__pelagoSoft) return value;
+      if (value.__pelagoLive || value.__pelagoSoft) return value;
     } catch (e) {}
     label = label || "soft";
     try {
@@ -1203,8 +1344,16 @@ const HOST_SHIM: &str = r#"
       }
     });
   } catch (e) {}
-  global.matchMedia = window.matchMedia = function () { return soft({ matches: false, media: "", addListener: noop, removeListener: noop, addEventListener: noop, removeEventListener: noop }); };
-  global.getComputedStyle = window.getComputedStyle = function () { return soft({ getPropertyValue: function () { return ""; } }); };
+  global.matchMedia = window.matchMedia = function (query) {
+    var q = String(query || "");
+    var width = window.innerWidth || 1280;
+    var min = /min-width\s*:\s*(\d+)/i.exec(q);
+    var max = /max-width\s*:\s*(\d+)/i.exec(q);
+    var matches = true;
+    if (min && width < Number(min[1])) matches = false;
+    if (max && width > Number(max[1])) matches = false;
+    return { matches: matches, media: q, addListener: noop, removeListener: noop, addEventListener: noop, removeEventListener: noop };
+  };
   global.requestAnimationFrame = window.requestAnimationFrame = function (cb) {
     return setTimeout(function () { if (typeof cb === "function") cb(Date.now()); }, 0);
   };
@@ -1409,6 +1558,77 @@ const HOST_SHIM: &str = r#"
     }
     return target;
   };
+  function camelToKebab(name) {
+    return String(name).replace(/[A-Z]/g, function (ch) { return "-" + ch.toLowerCase(); });
+  }
+  function readDecl(css, name) {
+    var want = camelToKebab(name).toLowerCase();
+    var parts = String(css || "").split(";");
+    for (var i = 0; i < parts.length; i++) {
+      var pair = parts[i].split(":");
+      if (pair.length < 2) continue;
+      if (pair[0].trim().toLowerCase() === want) return pair.slice(1).join(":").trim();
+    }
+    return "";
+  }
+  function writeDecl(css, name, value) {
+    var want = camelToKebab(name).toLowerCase();
+    var kept = [];
+    var parts = String(css || "").split(";");
+    for (var i = 0; i < parts.length; i++) {
+      var pair = parts[i].split(":");
+      if (pair.length < 2) continue;
+      if (pair[0].trim().toLowerCase() === want) continue;
+      kept.push(pair[0].trim() + ": " + pair.slice(1).join(":").trim());
+    }
+    if (value != null && String(value) !== "") kept.push(want + ": " + String(value));
+    return kept.join("; ");
+  }
+  global.__pelagoBindExtras = function (el) {
+    if (!el || el.__pelagoBound) return;
+    try { el.__pelagoBound = true; } catch (e) { return; }
+    var style = new Proxy({ __pelagoLive: true }, {
+      get: function (_, prop) {
+        if (prop === "__pelagoLive") return true;
+        var css = el.getAttribute("style") || "";
+        if (prop === "cssText") return css;
+        if (prop === "setProperty") return function (name, value) { el.setAttribute("style", writeDecl(el.getAttribute("style") || "", name, value)); };
+        if (prop === "getPropertyValue") return function (name) { return readDecl(el.getAttribute("style") || "", name); };
+        if (prop === "removeProperty") return function (name) { el.setAttribute("style", writeDecl(el.getAttribute("style") || "", name, "")); };
+        if (typeof prop !== "string") return undefined;
+        return readDecl(css, prop);
+      },
+      set: function (_, prop, value) {
+        if (prop === "cssText") el.setAttribute("style", value == null ? "" : String(value));
+        else if (typeof prop === "string") el.setAttribute("style", writeDecl(el.getAttribute("style") || "", prop, value));
+        return true;
+      }
+    });
+    var dataset = new Proxy({ __pelagoLive: true }, {
+      get: function (_, prop) {
+        if (prop === "__pelagoLive") return true;
+        if (typeof prop !== "string") return undefined;
+        var value = el.getAttribute("data-" + camelToKebab(prop));
+        return value == null || value === "" ? undefined : value;
+      },
+      set: function (_, prop, value) {
+        if (typeof prop !== "string") return true;
+        el.setAttribute("data-" + camelToKebab(prop), value == null ? "" : String(value));
+        return true;
+      }
+    });
+    try { el.style = style; el.dataset = dataset; } catch (e) {}
+    if (String(el.tagName || "").toLowerCase() === "form") {
+      el.submit = function () {
+        var ev = new Event("submit", { cancelable: true, bubbles: true });
+        var proceed = true;
+        try { proceed = el.dispatchEvent(ev); } catch (e) {}
+        if (proceed === false || ev.defaultPrevented) return;
+        var action = el.getAttribute("action");
+        if (action) location.href = action;
+      };
+    }
+  };
   global.$ = global.jQuery = window.$ = window.jQuery = jQuery;
   global.bds = window.bds = window.bds || soft({ util: soft({}), conf: soft({}), event: soft({ on: noop, un: noop, trigger: noop }) });
   global.F = window.F = window.F || soft({});
@@ -1552,7 +1772,25 @@ fn query_one_node(doc: &Document, id: NodeId, selector: &str) -> bool {
     let NodeData::Element { tag: node_tag, attrs } = &doc.nodes[id.0].data else {
         return false;
     };
+    let node_tag = node_tag.clone();
+    let attrs = attrs.clone();
     let selector = selector.trim();
+    if let Some((head, pseudo)) = selector.split_once(':') {
+        if pseudo == "first-child" && !head.contains(':') {
+            return is_first_element_child(doc, id) && (head.is_empty() || query_one_node(doc, id, head));
+        }
+    }
+    if let Some(start) = selector.find('[') {
+        let tag = selector[..start].trim();
+        let rest = &selector[start + 1..];
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        if !tag.is_empty() && !node_tag.eq_ignore_ascii_case(tag) {
+            return false;
+        }
+        return attr_selector_matches(&attrs, &rest[..end]);
+    }
     if let Some(wanted) = selector.strip_prefix('#') {
         return !wanted.contains([' ', '.']) && attrs.iter().any(|(key, value)| key.eq_ignore_ascii_case("id") && value == wanted);
     }
@@ -1591,8 +1829,30 @@ fn find_id(doc: &Document, id: &str) -> Option<NodeId> {
     })
 }
 
+fn is_first_element_child(doc: &Document, id: NodeId) -> bool {
+    let Some(parent) = doc.parent_of(id) else {
+        return false;
+    };
+    doc.element_children(parent).first().copied() == Some(id)
+}
+
+fn attr_selector_matches(attrs: &[(String, String)], inside: &str) -> bool {
+    let inside = inside.trim();
+    if let Some((name, value)) = inside.split_once('=') {
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        return attrs.iter().any(|(key, attr)| key.eq_ignore_ascii_case(name.trim()) && attr == value);
+    }
+    attrs.iter().any(|(key, _)| key.eq_ignore_ascii_case(inside))
+}
+
 fn query_one(doc: &Document, selector: &str) -> Option<NodeId> {
     let selector = selector.trim();
+    if selector.contains('[') || selector.contains(':') {
+        return doc.nodes.iter().enumerate().find_map(|(index, _)| {
+            let id = NodeId(index);
+            (doc.is_connected(id) && query_one_node(doc, id, selector)).then_some(id)
+        });
+    }
     if let Some(id) = selector.strip_prefix('#') {
         if !id.contains([' ', '.']) {
             return find_id(doc, id);
@@ -1626,6 +1886,76 @@ fn query_one(doc: &Document, selector: &str) -> Option<NodeId> {
         }
         Some(NodeId(index))
     })
+}
+
+fn control_value(doc: &Document, id: NodeId) -> String {
+    let tag = doc.tag_name(id).unwrap_or("");
+    if tag.eq_ignore_ascii_case("textarea") {
+        return doc.text_content(id);
+    }
+    doc.attr(id, "value").unwrap_or("").to_string()
+}
+
+fn set_control_value(doc: &mut Document, id: NodeId, value: &str) {
+    let tag = doc.tag_name(id).unwrap_or("").to_string();
+    doc.set_attr(id, "value", value.to_string());
+    if tag.eq_ignore_ascii_case("textarea") {
+        doc.set_text(id, value.to_string());
+    }
+}
+
+fn serialize_node_string(doc: &Document, id: NodeId) -> String {
+    let mut out = String::new();
+    serialize_node(doc, id, &mut out);
+    out
+}
+
+fn set_outer_html(doc: &mut Document, id: NodeId, html: &str) {
+    let Some(parent) = doc.parent_of(id) else {
+        return;
+    };
+    let next = doc.nodes[parent.0]
+        .children
+        .iter()
+        .position(|child| *child == id)
+        .and_then(|index| doc.nodes[parent.0].children.get(index + 1).copied());
+    let fragment = crate::engine::html::parse(html);
+    let children = fragment.nodes[fragment.root().0].children.clone();
+    if children.is_empty() {
+        doc.remove_child(parent, id);
+        return;
+    }
+    let mut first = true;
+    for child in children {
+        let created = copy_node_detached(&fragment, child, doc);
+        if first {
+            doc.replace_child(parent, created, id);
+            first = false;
+        } else {
+            doc.insert_before(parent, created, next);
+        }
+    }
+}
+
+fn copy_node_detached(src: &Document, id: NodeId, dst: &mut Document) -> NodeId {
+    match &src.nodes[id.0].data {
+        NodeData::Text(text) => dst.create(NodeData::Text(text.clone())),
+        NodeData::Element { tag, attrs } => {
+            let created = dst.create(NodeData::Element {
+                tag: tag.clone(),
+                attrs: attrs.clone(),
+            });
+            for child in src.nodes[id.0].children.clone() {
+                let copied = copy_node_detached(src, child, dst);
+                dst.append_child(created, copied);
+            }
+            created
+        }
+        NodeData::Document => dst.create(NodeData::Element {
+            tag: "#document-fragment".into(),
+            attrs: Vec::new(),
+        }),
+    }
 }
 
 fn set_inner_html(doc: &mut Document, id: NodeId, html: &str) {
@@ -1761,6 +2091,372 @@ fn copy_node(src: &Document, id: NodeId, dst: &mut Document, parent: NodeId) {
         }
         NodeData::Document => {}
     }
+}
+
+#[derive(Clone, Copy)]
+enum Metric {
+    Width,
+    Height,
+    ScrollWidth,
+    ScrollHeight,
+}
+
+struct ComputedStyle {
+    display: String,
+    color: String,
+    background: String,
+    font_size: String,
+    width: String,
+    height: String,
+    position: String,
+    text_align: String,
+    overflow: String,
+    opacity: String,
+    z_index: String,
+    min_width: String,
+    max_width: String,
+    min_height: String,
+    max_height: String,
+    visibility: String,
+    line_height: String,
+}
+
+impl ComputedStyle {
+    fn empty() -> Self {
+        Self {
+            display: "inline".into(),
+            color: "rgb(0, 0, 0)".into(),
+            background: "transparent".into(),
+            font_size: "16px".into(),
+            width: "auto".into(),
+            height: "auto".into(),
+            position: "static".into(),
+            text_align: "left".into(),
+            overflow: "visible".into(),
+            opacity: "1".into(),
+            z_index: "auto".into(),
+            min_width: "auto".into(),
+            max_width: "none".into(),
+            min_height: "auto".into(),
+            max_height: "none".into(),
+            visibility: "visible".into(),
+            line_height: "normal".into(),
+        }
+    }
+}
+
+fn metric_getter(doc: *mut Document, metric: Metric) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::from(0));
+        };
+        let (_, _, width, height) = node_box(doc, node);
+        let (scroll_w, scroll_h) = scroll_extent(doc, node, width, height);
+        let value = match metric {
+            Metric::Width => width,
+            Metric::Height => height,
+            Metric::ScrollWidth => scroll_w,
+            Metric::ScrollHeight => scroll_h,
+        };
+        Ok(JsValue::from(value as f64))
+    })
+}
+
+fn scroll_getter(doc: *mut Document, horizontal: bool) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::from(0));
+        };
+        let (left, top) = scroll_offset(doc, node);
+        Ok(JsValue::from(if horizontal { left } else { top } as f64))
+    })
+}
+
+fn scroll_setter(doc: *mut Document, horizontal: bool) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let value = args.get_or_undefined(0).to_number(context)?.max(0.0) as f32;
+        set_scroll_offset(doc, node, horizontal, value);
+        Ok(JsValue::undefined())
+    })
+}
+
+fn scroll_to_fn(doc: *mut Document) -> NativeFunction {
+    NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let first = args.get_or_undefined(0);
+        if let Some(object) = first.as_object() {
+            let left = object.get(js_string!("left"), context)?;
+            let top = object.get(js_string!("top"), context)?;
+            if left.is_number() {
+                set_scroll_offset(doc, node, true, left.to_number(context)?.max(0.0) as f32);
+            }
+            if top.is_number() {
+                set_scroll_offset(doc, node, false, top.to_number(context)?.max(0.0) as f32);
+            }
+        } else {
+            let left = first.to_number(context)?.max(0.0) as f32;
+            let top = args.get_or_undefined(1).to_number(context)?.max(0.0) as f32;
+            set_scroll_offset(doc, node, true, left);
+            set_scroll_offset(doc, node, false, top);
+        }
+        Ok(JsValue::undefined())
+    })
+}
+
+fn scroll_offset(doc: *mut Document, id: NodeId) -> (f32, f32) {
+    SCROLL_OFFSETS.with(|slot| slot.borrow().get(&(doc as usize, id.0)).copied().unwrap_or((0.0, 0.0)))
+}
+
+fn set_scroll_offset(doc: *mut Document, id: NodeId, horizontal: bool, value: f32) {
+    SCROLL_OFFSETS.with(|slot| {
+        let mut offsets = slot.borrow_mut();
+        let entry = offsets.entry((doc as usize, id.0)).or_insert((0.0, 0.0));
+        if horizontal {
+            entry.0 = value;
+        } else {
+            entry.1 = value;
+        }
+    });
+}
+
+fn scroll_extent(doc: *mut Document, id: NodeId, width: f32, height: f32) -> (f32, f32) {
+    let cached = BOX_CACHE.with(|slot| {
+        let (generation, ptr) = unsafe { ((*doc).generation, doc as usize) };
+        slot.borrow().as_ref().and_then(|cache| {
+            (cache.doc == ptr && cache.generation == generation)
+                .then(|| cache.boxes.get(&id.0).map(|box_| (box_.scroll_w, box_.scroll_h)))
+                .flatten()
+        })
+    });
+    let (scroll_w, scroll_h) = cached.unwrap_or((width, height));
+    let tag = unsafe { (*doc).tag_name(id).unwrap_or("") };
+    if tag.eq_ignore_ascii_case("body") || tag.eq_ignore_ascii_case("html") {
+        (scroll_w.max(1280.0), scroll_h.max(page_height(doc)))
+    } else {
+        (scroll_w, scroll_h)
+    }
+}
+
+fn page_height(doc: *mut Document) -> f32 {
+    let (generation, ptr) = unsafe { ((*doc).generation, doc as usize) };
+    BOX_CACHE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|cache| cache.doc == ptr && cache.generation == generation)
+            .map(|cache| cache.page_height)
+            .unwrap_or(0.0)
+    })
+}
+
+fn rect_value(x: f32, y: f32, width: f32, height: f32, context: &mut Context) -> JsResult<JsValue> {
+    let object = ObjectInitializer::new(context)
+        .property(js_string!("x"), x as f64, Attribute::all())
+        .property(js_string!("y"), y as f64, Attribute::all())
+        .property(js_string!("width"), width as f64, Attribute::all())
+        .property(js_string!("height"), height as f64, Attribute::all())
+        .property(js_string!("top"), y as f64, Attribute::all())
+        .property(js_string!("left"), x as f64, Attribute::all())
+        .property(js_string!("right"), (x + width) as f64, Attribute::all())
+        .property(js_string!("bottom"), (y + height) as f64, Attribute::all())
+        .build();
+    Ok(JsValue::from(object))
+}
+
+fn node_box(doc: *mut Document, id: NodeId) -> (f32, f32, f32, f32) {
+    let (generation, ptr) = unsafe { ((*doc).generation, doc as usize) };
+    let cached = BOX_CACHE.with(|slot| {
+        slot.borrow().as_ref().and_then(|cache| {
+            (cache.doc == ptr && cache.generation == generation)
+                .then(|| cache.boxes.get(&id.0).map(|box_| (box_.x, box_.y, box_.w, box_.h)))
+        })
+    });
+    if let Some(hit) = cached {
+        return hit.unwrap_or((0.0, 0.0, 0.0, 0.0));
+    }
+    let mut fonts = cosmic_text::FontSystem::new();
+    let mut images = ImageStore::new();
+    let scene = unsafe { layout::layout(&*doc, 1280.0, 720.0, None, &mut images, &mut fonts) };
+    let mut boxes = HashMap::new();
+    for NodeBox { id, x, y, w, h, scroll_w, scroll_h } in scene.boxes {
+        boxes.insert(
+            id.0,
+            LaidBox { x, y, w, h, scroll_w, scroll_h },
+        );
+    }
+    let found = boxes.get(&id.0).map(|box_| (box_.x, box_.y, box_.w, box_.h)).unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let page_height = scene.height;
+    BOX_CACHE.with(|slot| {
+        *slot.borrow_mut() = Some(BoxCache {
+            doc: ptr,
+            generation,
+            page_height,
+            boxes,
+        });
+    });
+    found
+}
+
+fn computed_style(doc: &Document, id: NodeId) -> ComputedStyle {
+    let NodeData::Element { .. } = &doc.nodes[id.0].data else {
+        return ComputedStyle::empty();
+    };
+    let sheet = style::stylesheet_with(doc, None, &|_| Err("跳过外链样式".into()));
+    let viewport = Viewport { width: 1280.0, height: 720.0 };
+    let mut chain = Vec::new();
+    let mut current = doc.parent_of(id);
+    while let Some(node) = current {
+        chain.push(node);
+        current = doc.parent_of(node);
+    }
+    chain.reverse();
+    let mut parent = style::root_style();
+    let mut ancestors = Vec::new();
+    for node in chain {
+        let NodeData::Element { tag, attrs } = &doc.nodes[node.0].data else {
+            continue;
+        };
+        let computed = style::compute(tag, attrs, &ancestors, &parent, &sheet, viewport, 1280.0);
+        ancestors.push(ElemSnap {
+            tag: tag.clone(),
+            attrs: attrs.clone(),
+        });
+        parent = computed.inherited();
+    }
+    let NodeData::Element { tag, attrs } = &doc.nodes[id.0].data else {
+        return ComputedStyle::empty();
+    };
+    let computed = style::compute(tag, attrs, &ancestors, &parent, &sheet, viewport, 1280.0);
+    let (x, _, width, height) = node_box(doc as *const Document as *mut Document, id);
+    let _ = x;
+    ComputedStyle {
+        display: display_name(computed.display).into(),
+        color: color_name(computed.color),
+        background: computed.background.map(color_name).unwrap_or_else(|| "transparent".into()),
+        font_size: format!("{}px", computed.font_size.round() as i32),
+        width: if width > 0.0 { format!("{}px", width.round() as i32) } else { "auto".into() },
+        height: if height > 0.0 { format!("{}px", height.round() as i32) } else { "auto".into() },
+        position: position_name(computed.position).into(),
+        text_align: text_align_name(computed.text_align).into(),
+        overflow: overflow_name(computed.overflow).into(),
+        opacity: trim_num(computed.opacity),
+        z_index: computed.z_index.map(|value| value.to_string()).unwrap_or_else(|| "auto".into()),
+        min_width: px_or(computed.min_width, "auto"),
+        max_width: px_or(computed.max_width, "none"),
+        min_height: px_or(computed.min_height, "auto"),
+        max_height: px_or(computed.max_height, "none"),
+        visibility: if computed.visibility_hidden { "hidden" } else { "visible" }.into(),
+        line_height: format!("{}px", computed.line_height.round() as i32),
+    }
+}
+
+fn px_or(value: Option<f32>, fallback: &str) -> String {
+    value.map(|px| format!("{}px", px.round() as i32)).unwrap_or_else(|| fallback.to_string())
+}
+
+fn trim_num(value: f32) -> String {
+    if (value - value.round()).abs() < 0.001 {
+        format!("{}", value.round() as i32)
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn overflow_name(overflow: Overflow) -> &'static str {
+    match overflow {
+        Overflow::Visible => "visible",
+        Overflow::Hidden => "hidden",
+        Overflow::Scroll => "scroll",
+    }
+}
+
+fn position_name(position: Position) -> &'static str {
+    match position {
+        Position::Static => "static",
+        Position::Relative => "relative",
+        Position::Absolute => "absolute",
+    }
+}
+
+fn text_align_name(align: TextAlign) -> &'static str {
+    match align {
+        TextAlign::Left => "left",
+        TextAlign::Center => "center",
+        TextAlign::Right => "right",
+    }
+}
+
+fn display_name(display: Display) -> &'static str {
+    match display {
+        Display::Block => "block",
+        Display::Inline => "inline",
+        Display::InlineBlock => "inline-block",
+        Display::Flex => "flex",
+        Display::Grid => "grid",
+        Display::None => "none",
+    }
+}
+
+fn color_name(color: cosmic_text::Color) -> String {
+    format!("rgb({}, {}, {})", color.r(), color.g(), color.b())
+}
+
+fn style_value(style: &ComputedStyle, context: &mut Context) -> JsResult<JsValue> {
+    let lookup = NativeFunction::from_copy_closure(|this, args, context| {
+        let name = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+        let key = match name.to_ascii_lowercase().as_str() {
+            "font-size" | "fontsize" => "fontSize",
+            "background-color" | "backgroundcolor" => "backgroundColor",
+            "text-align" | "textalign" => "textAlign",
+            "display" => "display",
+            "color" => "color",
+            "width" => "width",
+            "height" => "height",
+            "position" => "position",
+            "overflow" => "overflow",
+            "opacity" => "opacity",
+            "z-index" | "zindex" => "zIndex",
+            "min-width" | "minwidth" => "minWidth",
+            "max-width" | "maxwidth" => "maxWidth",
+            "min-height" | "minheight" => "minHeight",
+            "max-height" | "maxheight" => "maxHeight",
+            "visibility" => "visibility",
+            "line-height" | "lineheight" => "lineHeight",
+            _ => "",
+        };
+        let Some(object) = this.as_object() else {
+            return Ok(JsValue::from(JsString::from("")));
+        };
+        if key.is_empty() {
+            return Ok(JsValue::from(JsString::from("")));
+        }
+        object.get(JsString::from(key), context)
+    });
+    let object = ObjectInitializer::new(context)
+        .property(js_string!("display"), JsString::from(style.display.as_str()), Attribute::all())
+        .property(js_string!("color"), JsString::from(style.color.as_str()), Attribute::all())
+        .property(js_string!("fontSize"), JsString::from(style.font_size.as_str()), Attribute::all())
+        .property(js_string!("backgroundColor"), JsString::from(style.background.as_str()), Attribute::all())
+        .property(js_string!("width"), JsString::from(style.width.as_str()), Attribute::all())
+        .property(js_string!("height"), JsString::from(style.height.as_str()), Attribute::all())
+        .property(js_string!("position"), JsString::from(style.position.as_str()), Attribute::all())
+        .property(js_string!("textAlign"), JsString::from(style.text_align.as_str()), Attribute::all())
+        .property(js_string!("overflow"), JsString::from(style.overflow.as_str()), Attribute::all())
+        .property(js_string!("opacity"), JsString::from(style.opacity.as_str()), Attribute::all())
+        .property(js_string!("zIndex"), JsString::from(style.z_index.as_str()), Attribute::all())
+        .property(js_string!("minWidth"), JsString::from(style.min_width.as_str()), Attribute::all())
+        .property(js_string!("maxWidth"), JsString::from(style.max_width.as_str()), Attribute::all())
+        .property(js_string!("minHeight"), JsString::from(style.min_height.as_str()), Attribute::all())
+        .property(js_string!("maxHeight"), JsString::from(style.max_height.as_str()), Attribute::all())
+        .property(js_string!("visibility"), JsString::from(style.visibility.as_str()), Attribute::all())
+        .property(js_string!("lineHeight"), JsString::from(style.line_height.as_str()), Attribute::all())
+        .function(lookup, js_string!("getPropertyValue"), 1)
+        .build();
+    Ok(JsValue::from(object))
 }
 
 fn location_part(href: &str, part: &str) -> String {
@@ -2053,6 +2749,156 @@ mod tests {
             "misses={:?}",
             result.api_misses
         );
+    }
+
+    #[test]
+    fn reflow_uses_width_height_and_overflow() {
+        let mut doc = parse(
+            r#"<body>
+            <div id="box" style="width:200px;max-width:120px;height:30px;overflow:hidden;position:relative;left:8px;opacity:0.5;z-index:3;line-height:20px">
+              <div style="height:80px">inner</div>
+            </div>
+            <script>
+            var box = document.getElementById("box");
+            box.style.minHeight = "10px";
+            var rect = box.getBoundingClientRect();
+            var style = getComputedStyle(box);
+            document.body.setAttribute("data-w", String(Math.round(rect.width)));
+            document.body.setAttribute("data-h", String(Math.round(rect.height)));
+            document.body.setAttribute("data-sh", String(Math.round(box.scrollHeight)));
+            document.body.setAttribute("data-x", String(Math.round(rect.left)));
+            document.body.setAttribute("data-o", style.opacity);
+            document.body.setAttribute("data-z", style.zIndex);
+            document.body.setAttribute("data-p", style.position);
+            document.body.setAttribute("data-ov", style.overflow);
+            document.body.setAttribute("data-lh", style.lineHeight);
+            </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        let body = find_tag(&doc, "body").expect("body");
+        assert_eq!(doc.attr(body, "data-w"), Some("120"));
+        assert_eq!(doc.attr(body, "data-h"), Some("30"));
+        let scroll: f64 = doc.attr(body, "data-sh").unwrap_or("0").parse().unwrap_or(0.0);
+        assert!(scroll >= 80.0, "scrollHeight={scroll}");
+        let left: f64 = doc.attr(body, "data-x").unwrap_or("0").parse().unwrap_or(0.0);
+        assert!(left >= 8.0, "left={left}");
+        assert_eq!(doc.attr(body, "data-o"), Some("0.50"));
+        assert_eq!(doc.attr(body, "data-z"), Some("3"));
+        assert_eq!(doc.attr(body, "data-p"), Some("relative"));
+        assert_eq!(doc.attr(body, "data-ov"), Some("hidden"));
+        assert_eq!(doc.attr(body, "data-lh"), Some("20px"));
+    }
+
+    #[test]
+    fn scroll_metrics_and_computed_extras() {
+        let mut doc = parse(
+            r#"<body>
+            <div id="box" style="height:80px;text-align:center">x</div>
+            <script>
+            var box = document.getElementById("box");
+            box.scrollTop = 12;
+            box.scrollTo({ left: 3 });
+            var style = getComputedStyle(box);
+            document.body.setAttribute("data-sh", String(Math.round(document.body.scrollHeight)));
+            document.body.setAttribute("data-sw", String(Math.round(box.scrollWidth)));
+            document.body.setAttribute("data-st", String(box.scrollTop));
+            document.body.setAttribute("data-sl", String(box.scrollLeft));
+            document.body.setAttribute("data-p", style.position);
+            document.body.setAttribute("data-a", style.textAlign);
+            document.body.setAttribute("data-bg", style.getPropertyValue("background-color"));
+            </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        let body = find_tag(&doc, "body").expect("body");
+        let page: f64 = doc.attr(body, "data-sh").unwrap_or("0").parse().unwrap_or(0.0);
+        let width: f64 = doc.attr(body, "data-sw").unwrap_or("0").parse().unwrap_or(0.0);
+        assert!(page > 40.0, "scrollHeight={page}");
+        assert!(width > 40.0, "scrollWidth={width}");
+        assert_eq!(doc.attr(body, "data-st"), Some("12"));
+        assert_eq!(doc.attr(body, "data-sl"), Some("3"));
+        assert_eq!(doc.attr(body, "data-p"), Some("static"));
+        assert_eq!(doc.attr(body, "data-a"), Some("center"));
+        assert_eq!(doc.attr(body, "data-bg"), Some("transparent"));
+    }
+
+    #[test]
+    fn form_submit_and_geometry() {
+        let mut doc = parse(
+            r#"<body>
+            <div id="box" style="display:block;height:40px;width:200px">hi</div>
+            <form id="search" action="/search"><input id="q" name="q"></form>
+            <script>
+            var box = document.getElementById("box");
+            var rect = box.getBoundingClientRect();
+            var style = getComputedStyle(box);
+            var seen = "no";
+            var form = document.getElementById("search");
+            form.addEventListener("submit", function (event) {
+              event.preventDefault();
+              seen = "yes";
+            });
+            form.submit();
+            document.body.setAttribute("data-w", String(Math.round(rect.width)));
+            document.body.setAttribute("data-h", String(Math.round(box.offsetHeight)));
+            document.body.setAttribute("data-d", style.display);
+            document.body.setAttribute("data-s", seen);
+            document.body.setAttribute("data-m", String(matchMedia("(min-width: 800px)").matches));
+            document.body.setAttribute("data-n", String(matchMedia("(min-width: 2000px)").matches));
+            </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert!(result.navigation.is_none(), "preventDefault 后不应导航");
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        let body = find_tag(&doc, "body").expect("body");
+        assert_eq!(doc.attr(body, "data-d"), Some("block"));
+        assert_eq!(doc.attr(body, "data-s"), Some("yes"));
+        assert_eq!(doc.attr(body, "data-m"), Some("true"));
+        assert_eq!(doc.attr(body, "data-n"), Some("false"));
+        let width: f64 = doc.attr(body, "data-w").unwrap_or("0").parse().unwrap_or(0.0);
+        let height: f64 = doc.attr(body, "data-h").unwrap_or("0").parse().unwrap_or(0.0);
+        assert!(width > 100.0, "width={width}");
+        assert!(height > 20.0, "height={height}");
+    }
+
+    #[test]
+    fn phase2_dom_surface() {
+        let mut doc = parse(
+            r#"<body>
+            <div id="box"><span id="old">old</span><span>next</span></div>
+            <input id="q" type="text" value="">
+            <script>
+            var box = document.getElementById("box");
+            var fresh = document.createElement("b");
+            fresh.textContent = "new";
+            box.replaceChild(fresh, document.getElementById("old"));
+            box.dataset.userId = "7";
+            box.style.color = "red";
+            box.style.cssText = "color: blue; display: flex";
+            var input = document.querySelector("input[type=text]");
+            input.value = "pelago";
+            var first = document.querySelector("div:first-child");
+            document.body.setAttribute("data-html", box.outerHTML);
+            document.body.setAttribute("data-style", box.getAttribute("style"));
+            document.body.setAttribute("data-id", box.dataset.userId);
+            document.body.setAttribute("data-q", input.value);
+            document.body.setAttribute("data-first", first ? first.id : "");
+            </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        let body = find_tag(&doc, "body").expect("body");
+        let html = doc.attr(body, "data-html").unwrap_or("");
+        assert!(html.contains("<b>"), "{html}");
+        assert!(html.contains("next"), "{html}");
+        assert!(!html.contains("old"), "{html}");
+        assert_eq!(doc.attr(body, "data-style"), Some("color: blue; display: flex"));
+        assert_eq!(doc.attr(body, "data-id"), Some("7"));
+        assert_eq!(doc.attr(body, "data-q"), Some("pelago"));
+        assert_eq!(doc.attr(find_id(&doc, "q").unwrap(), "value"), Some("pelago"));
+        assert_eq!(doc.attr(body, "data-first"), Some("box"));
+        assert_eq!(doc.attr(find_id(&doc, "box").unwrap(), "data-user-id"), Some("7"));
     }
 
     #[test]
