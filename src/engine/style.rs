@@ -1,12 +1,58 @@
 use cosmic_text::Color;
 
-use crate::engine::dom::{Document, NodeData};
+use crate::engine::dom::{Document, NodeData, NodeId};
+use crate::net::url::resolve_url;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
     Block,
     Inline,
+    InlineBlock,
+    Flex,
+    Grid,
     None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    Column,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Justify {
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignItems {
+    Stretch,
+    Start,
+    Center,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatSide {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Position {
+    Static,
+    Absolute,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Track {
+    Px(f32),
+    Percent(f32),
+    Fr(f32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,12 +98,52 @@ struct Declared {
     padding: Edges,
     text_align: Option<TextAlign>,
     display: Option<Display>,
+    width: Option<Length>,
+    height: Option<Length>,
+    flex_direction: Option<FlexDirection>,
+    justify_content: Option<Justify>,
+    align_items: Option<AlignItems>,
+    gap: Option<Length>,
+    flex_grow: Option<f32>,
+    float: Option<FloatSide>,
+    position: Option<Position>,
+    inset: Edges,
+    grid_columns: Option<[Option<Track>; 6]>,
+    grid_column_count: Option<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct Selector {
+    steps: Vec<Compound>,
+    /// `direct[i]` 为真表示 steps[i] 与 steps[i + 1] 之间是子代选择器。
+    direct: Vec<bool>,
+    specificity: (u32, u32, u32),
+}
+
+#[derive(Clone, Debug)]
+struct Compound {
+    simples: Vec<SimpleSel>,
+}
+
+#[derive(Clone, Debug)]
+enum SimpleSel {
+    Tag(String),
+    Class(String),
+    Id(String),
+    Universal,
 }
 
 #[derive(Clone, Debug)]
 struct Rule {
-    tags: Vec<String>,
+    selector: Selector,
     declared: Declared,
+    order: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ElemSnap {
+    pub tag: String,
+    pub attrs: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,27 +166,126 @@ pub struct Computed {
     pub margin: [f32; 4],
     pub padding: [f32; 4],
     pub text_align: TextAlign,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub flex_direction: FlexDirection,
+    pub justify_content: Justify,
+    pub align_items: AlignItems,
+    pub gap: f32,
+    pub flex_grow: f32,
+    pub float: FloatSide,
+    pub position: Position,
+    pub top: Option<f32>,
+    pub right: Option<f32>,
+    pub bottom: Option<f32>,
+    pub left: Option<f32>,
+    pub grid_columns: [Option<Track>; 6],
+    pub grid_column_count: u8,
 }
 
-pub fn stylesheet(doc: &Document) -> Stylesheet {
+pub fn stylesheet(doc: &Document, base_url: Option<&str>) -> Stylesheet {
+    stylesheet_with(doc, base_url, &|url| {
+        crate::net::fetch_bytes(url, 1024 * 1024)
+            .map(|response| String::from_utf8_lossy(&response.bytes).into_owned())
+            .map_err(|err| err.to_string())
+    })
+}
+
+pub fn stylesheet_with(
+    doc: &Document,
+    base_url: Option<&str>,
+    fetch: &dyn Fn(&str) -> Result<String, String>,
+) -> Stylesheet {
     let mut css = String::new();
-    for node in &doc.nodes {
-        let NodeData::Element { tag, .. } = &node.data else {
-            continue;
-        };
-        if tag != "style" {
-            continue;
-        }
-        for child in &node.children {
-            if let NodeData::Text(text) = &doc.nodes[child.0].data {
-                css.push_str(text);
-                css.push('\n');
-            }
-        }
-    }
+    collect_css(doc, doc.root(), base_url, fetch, &mut css, 0);
     Stylesheet {
         rules: parse_stylesheet(&css),
     }
+}
+
+fn collect_css(
+    doc: &Document,
+    id: NodeId,
+    base_url: Option<&str>,
+    fetch: &dyn Fn(&str) -> Result<String, String>,
+    css: &mut String,
+    depth: u32,
+) {
+    let node = &doc.nodes[id.0];
+    match &node.data {
+        NodeData::Element { tag, attrs } if tag.eq_ignore_ascii_case("style") => {
+            for child in &node.children {
+                if let NodeData::Text(text) = &doc.nodes[child.0].data {
+                    css.push_str(text);
+                    css.push('\n');
+                }
+            }
+        }
+        NodeData::Element { tag, attrs } if tag.eq_ignore_ascii_case("link") && depth < 4 => {
+            let rel = attr_value(attrs, "rel").unwrap_or("");
+            let is_sheet = rel.split_whitespace().any(|part| part.eq_ignore_ascii_case("stylesheet"));
+            if is_sheet {
+                if let Some(href) = attr_value(attrs, "href") {
+                    if let Some(url) = resolve_url(base_url, href) {
+                        match fetch(&url) {
+                            Ok(text) => append_css_imports(&text, Some(&url), fetch, css, depth + 1),
+                            Err(err) => eprintln!("样式表加载失败 {url}：{err}"),
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in node.children.clone() {
+        collect_css(doc, child, base_url, fetch, css, depth);
+    }
+}
+
+fn append_css_imports(
+    text: &str,
+    base_url: Option<&str>,
+    fetch: &dyn Fn(&str) -> Result<String, String>,
+    css: &mut String,
+    depth: u32,
+) {
+    if depth >= 4 {
+        css.push_str(text);
+        css.push('\n');
+        return;
+    }
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(url) = import_url(trimmed) {
+            if let Some(resolved) = resolve_url(base_url, url) {
+                match fetch(&resolved) {
+                    Ok(imported) => append_css_imports(&imported, Some(&resolved), fetch, css, depth + 1),
+                    Err(err) => eprintln!("样式表加载失败 {resolved}：{err}"),
+                }
+            }
+        }
+    }
+    css.push_str(text);
+    css.push('\n');
+}
+
+fn import_url(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("@import")?.trim();
+    let rest = rest.strip_suffix(';').unwrap_or(rest).trim();
+    if let Some(inner) = rest.strip_prefix("url(") {
+        let inner = inner.trim().trim_end_matches(')').trim();
+        return Some(inner.trim_matches(['"', '\'']));
+    }
+    if rest.starts_with('"') || rest.starts_with('\'') {
+        let quote = rest.chars().next()?;
+        let body = rest[1..].split(quote).next()?;
+        return Some(body);
+    }
+    None
+}
+
+fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
 }
 
 pub fn root_style() -> Computed {
@@ -112,12 +297,28 @@ pub fn root_style() -> Computed {
         margin: [0.0; 4],
         padding: [0.0; 4],
         text_align: TextAlign::Left,
+        width: None,
+        height: None,
+        flex_direction: FlexDirection::Row,
+        justify_content: Justify::Start,
+        align_items: AlignItems::Stretch,
+        gap: 0.0,
+        flex_grow: 0.0,
+        float: FloatSide::None,
+        position: Position::Static,
+        top: None,
+        right: None,
+        bottom: None,
+        left: None,
+        grid_columns: [None; 6],
+        grid_column_count: 0,
     }
 }
 
 pub fn compute(
     tag: &str,
     attrs: &[(String, String)],
+    ancestors: &[ElemSnap],
     parent: &Computed,
     sheet: &Stylesheet,
     viewport: Viewport,
@@ -125,14 +326,16 @@ pub fn compute(
 ) -> Computed {
     let mut style = parent.inherited();
     apply_user_agent(&mut style, tag, parent.font_size);
-    for rule in sheet.rules.iter().filter(|rule| rule.tags.iter().any(|name| name == tag)) {
-        apply_declared(
-            &mut style,
-            &rule.declared,
-            parent.font_size,
-            viewport,
-            containing_width,
-        );
+    for rule in &sheet.rules {
+        if selector_matches(&rule.selector, tag, attrs, ancestors) {
+            apply_declared(
+                &mut style,
+                &rule.declared,
+                parent.font_size,
+                viewport,
+                containing_width,
+            );
+        }
     }
     if let Some(inline) = attrs.iter().find(|(name, _)| name == "style").map(|(_, value)| value) {
         let declared = parse_declarations(inline);
@@ -149,7 +352,7 @@ pub fn compute(
 }
 
 impl Computed {
-    fn inherited(self) -> Self {
+    fn inherited(&self) -> Self {
         Self {
             display: Display::Inline,
             color: self.color,
@@ -158,6 +361,21 @@ impl Computed {
             margin: [0.0; 4],
             padding: [0.0; 4],
             text_align: self.text_align,
+            width: None,
+            height: None,
+            flex_direction: FlexDirection::Row,
+            justify_content: Justify::Start,
+            align_items: AlignItems::Stretch,
+            gap: 0.0,
+            flex_grow: 0.0,
+            float: FloatSide::None,
+            position: Position::Static,
+            top: None,
+            right: None,
+            bottom: None,
+            left: None,
+            grid_columns: [None; 6],
+            grid_column_count: 0,
         }
     }
 }
@@ -275,6 +493,41 @@ fn apply_declared(
     if let Some(display) = declared.display {
         style.display = display;
     }
+    if let Some(width) = declared.width {
+        style.width = resolve_used_length(width, style.font_size, viewport, containing_width);
+    }
+    if let Some(height) = declared.height {
+        style.height = resolve_used_length(height, style.font_size, viewport, viewport.height);
+    }
+    if let Some(direction) = declared.flex_direction {
+        style.flex_direction = direction;
+    }
+    if let Some(justify) = declared.justify_content {
+        style.justify_content = justify;
+    }
+    if let Some(align) = declared.align_items {
+        style.align_items = align;
+    }
+    if let Some(gap) = declared.gap {
+        style.gap = resolve_used_length(gap, style.font_size, viewport, containing_width).unwrap_or(0.0);
+    }
+    if let Some(grow) = declared.flex_grow {
+        style.flex_grow = grow;
+    }
+    if let Some(float) = declared.float {
+        style.float = float;
+    }
+    if let Some(position) = declared.position {
+        style.position = position;
+    }
+    style.top = declared.inset.top.and_then(|length| resolve_used_length(length, style.font_size, viewport, viewport.height)).or(style.top);
+    style.right = declared.inset.right.and_then(|length| resolve_used_length(length, style.font_size, viewport, containing_width)).or(style.right);
+    style.bottom = declared.inset.bottom.and_then(|length| resolve_used_length(length, style.font_size, viewport, viewport.height)).or(style.bottom);
+    style.left = declared.inset.left.and_then(|length| resolve_used_length(length, style.font_size, viewport, containing_width)).or(style.left);
+    if let Some(count) = declared.grid_column_count {
+        style.grid_column_count = count;
+        style.grid_columns = declared.grid_columns.unwrap_or([None; 6]);
+    }
     if let Some(text_align) = declared.text_align {
         style.text_align = text_align;
     }
@@ -325,37 +578,198 @@ fn resolve_font_size(size: FontSize, parent_font: f32) -> f32 {
     }
 }
 
+fn resolve_used_length(length: Length, font_size: f32, viewport: Viewport, containing: f32) -> Option<f32> {
+    match length {
+        Length::Auto => None,
+        Length::Px(n) => Some(n),
+        Length::Em(n) => Some(n * font_size),
+        Length::Rem(n) => Some(n * 16.0),
+        Length::Percent(n) => Some(n / 100.0 * containing),
+        Length::Vh(n) => Some(n / 100.0 * viewport.height),
+        Length::Vw(n) => Some(n / 100.0 * viewport.width),
+    }
+}
+
 fn parse_stylesheet(css: &str) -> Vec<Rule> {
     let css = strip_comments(css);
     let mut rules = Vec::new();
+    let mut order = 0u32;
     for chunk in css.split('}') {
         let Some((selector, body)) = chunk.split_once('{') else {
             continue;
         };
-        let tags = selector
-            .split(',')
-            .filter_map(|part| simple_tag(part.trim()))
-            .collect::<Vec<_>>();
-        if tags.is_empty() {
-            continue;
+        let declared = parse_declarations(body);
+        for part in split_selector_list(selector) {
+            let Some(selector) = parse_selector(part.trim()) else {
+                continue;
+            };
+            rules.push(Rule {
+                selector,
+                declared: declared.clone(),
+                order,
+            });
+            order += 1;
         }
-        rules.push(Rule {
-            tags,
-            declared: parse_declarations(body),
-        });
     }
+    rules.sort_by_key(|rule| (rule.selector.specificity, rule.order));
     rules
 }
 
-fn simple_tag(selector: &str) -> Option<String> {
-    if selector.is_empty() {
+fn split_selector_list(selector: &str) -> Vec<&str> {
+    selector.split(',').map(str::trim).filter(|part| !part.is_empty()).collect()
+}
+
+fn parse_selector(selector: &str) -> Option<Selector> {
+    if selector.chars().any(|ch| matches!(ch, '[' | ':' | '+' | '~')) {
         return None;
     }
-    if selector.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
-        Some(selector.to_ascii_lowercase())
-    } else {
-        None
+    let mut steps = Vec::new();
+    let mut direct = Vec::new();
+    let mut current = String::new();
+    let mut chars = selector.chars().peekable();
+    let mut next_direct = false;
+    while let Some(ch) = chars.next() {
+        if ch == '>' {
+            push_compound(&mut steps, &mut direct, &mut current, next_direct)?;
+            next_direct = true;
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.trim().is_empty() {
+                push_compound(&mut steps, &mut direct, &mut current, next_direct)?;
+                next_direct = false;
+            }
+            continue;
+        }
+        current.push(ch);
     }
+    push_compound(&mut steps, &mut direct, &mut current, next_direct)?;
+    if steps.is_empty() {
+        return None;
+    }
+    let mut ids = 0;
+    let mut classes = 0;
+    let mut tags = 0;
+    for step in &steps {
+        for simple in &step.simples {
+            match simple {
+                SimpleSel::Id(_) => ids += 1,
+                SimpleSel::Class(_) => classes += 1,
+                SimpleSel::Tag(_) => tags += 1,
+                SimpleSel::Universal => {}
+            }
+        }
+    }
+    Some(Selector {
+        steps,
+        direct,
+        specificity: (ids, classes, tags),
+    })
+}
+
+fn push_compound(steps: &mut Vec<Compound>, direct: &mut Vec<bool>, current: &mut String, is_direct: bool) -> Option<()> {
+    let text = current.trim();
+    if text.is_empty() {
+        return Some(());
+    }
+    let compound = parse_compound(text)?;
+    if !steps.is_empty() {
+        direct.push(is_direct);
+    }
+    steps.push(compound);
+    current.clear();
+    Some(())
+}
+
+fn parse_compound(raw: &str) -> Option<Compound> {
+    let mut simples = Vec::new();
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    if bytes.first().is_some_and(|ch| *ch != b'.' && *ch != b'#') {
+        let start = index;
+        while index < bytes.len() && bytes[index] != b'.' && bytes[index] != b'#' {
+            index += 1;
+        }
+        let tag = &raw[start..index];
+        if tag == "*" {
+            simples.push(SimpleSel::Universal);
+        } else if tag.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
+            simples.push(SimpleSel::Tag(tag.to_ascii_lowercase()));
+        } else {
+            return None;
+        }
+    }
+    while index < raw.len() {
+        let kind = bytes[index];
+        if kind != b'.' && kind != b'#' {
+            return None;
+        }
+        index += 1;
+        let start = index;
+        while index < raw.len() && bytes[index] != b'.' && bytes[index] != b'#' {
+            index += 1;
+        }
+        let name = &raw[start..index];
+        if name.is_empty() {
+            return None;
+        }
+        if kind == b'.' {
+            simples.push(SimpleSel::Class(name.to_string()));
+        } else {
+            simples.push(SimpleSel::Id(name.to_string()));
+        }
+    }
+    if simples.is_empty() { None } else { Some(Compound { simples }) }
+}
+
+fn selector_matches(selector: &Selector, tag: &str, attrs: &[(String, String)], ancestors: &[ElemSnap]) -> bool {
+    let Some((subject, rest)) = selector.steps.split_last() else {
+        return false;
+    };
+    if !compound_matches(subject, tag, attrs) {
+        return false;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    let mut available = ancestors.len();
+    for index in (0..rest.len()).rev() {
+        let direct = selector.direct.get(index).copied().unwrap_or(false);
+        if direct {
+            if available == 0 {
+                return false;
+            }
+            available -= 1;
+            let ancestor = &ancestors[available];
+            if !compound_matches(&rest[index], &ancestor.tag, &ancestor.attrs) {
+                return false;
+            }
+        } else {
+            let mut found = false;
+            while available > 0 {
+                available -= 1;
+                let ancestor = &ancestors[available];
+                if compound_matches(&rest[index], &ancestor.tag, &ancestor.attrs) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn compound_matches(compound: &Compound, tag: &str, attrs: &[(String, String)]) -> bool {
+    compound.simples.iter().all(|simple| match simple {
+        SimpleSel::Universal => true,
+        SimpleSel::Tag(name) => tag.eq_ignore_ascii_case(name),
+        SimpleSel::Id(name) => attr_value(attrs, "id").is_some_and(|id| id == name),
+        SimpleSel::Class(name) => attr_value(attrs, "class")
+            .is_some_and(|class| class.split_whitespace().any(|part| part == name)),
+    })
 }
 
 fn parse_declarations(block: &str) -> Declared {
@@ -416,11 +830,115 @@ fn apply_declaration(declared: &mut Declared, name: &str, value: &str) {
             declared.display = match value.to_ascii_lowercase().as_str() {
                 "block" => Some(Display::Block),
                 "inline" => Some(Display::Inline),
+                "inline-block" => Some(Display::InlineBlock),
+                "flex" | "inline-flex" => Some(Display::Flex),
+                "grid" | "inline-grid" => Some(Display::Grid),
                 "none" => Some(Display::None),
                 _ => None,
             };
         }
+        "width" => declared.width = parse_length(value),
+        "height" => declared.height = parse_length(value),
+        "flex-direction" => {
+            declared.flex_direction = match value.to_ascii_lowercase().as_str() {
+                "row" | "row-reverse" => Some(FlexDirection::Row),
+                "column" | "column-reverse" => Some(FlexDirection::Column),
+                _ => None,
+            };
+        }
+        "justify-content" => {
+            declared.justify_content = match value.to_ascii_lowercase().as_str() {
+                "center" => Some(Justify::Center),
+                "flex-end" | "end" => Some(Justify::End),
+                "space-between" => Some(Justify::SpaceBetween),
+                "flex-start" | "start" | "normal" => Some(Justify::Start),
+                _ => None,
+            };
+        }
+        "align-items" => {
+            declared.align_items = match value.to_ascii_lowercase().as_str() {
+                "center" => Some(AlignItems::Center),
+                "flex-start" | "start" => Some(AlignItems::Start),
+                "flex-end" | "end" => Some(AlignItems::End),
+                "stretch" => Some(AlignItems::Stretch),
+                _ => None,
+            };
+        }
+        "gap" | "column-gap" | "row-gap" => declared.gap = parse_length(value),
+        "flex-grow" => declared.flex_grow = value.trim().parse().ok(),
+        "float" => {
+            declared.float = match value.to_ascii_lowercase().as_str() {
+                "left" => Some(FloatSide::Left),
+                "right" => Some(FloatSide::Right),
+                "none" => Some(FloatSide::None),
+                _ => None,
+            };
+        }
+        "position" => {
+            declared.position = match value.to_ascii_lowercase().as_str() {
+                "absolute" | "fixed" => Some(Position::Absolute),
+                "static" | "relative" | "sticky" => Some(Position::Static),
+                _ => None,
+            };
+        }
+        "top" => declared.inset.top = parse_length(value),
+        "right" => declared.inset.right = parse_length(value),
+        "bottom" => declared.inset.bottom = parse_length(value),
+        "left" => declared.inset.left = parse_length(value),
+        "grid-template-columns" => {
+            let (tracks, count) = parse_tracks(value);
+            declared.grid_columns = Some(tracks);
+            declared.grid_column_count = Some(count);
+        }
         _ => {}
+    }
+}
+
+fn parse_tracks(value: &str) -> ([Option<Track>; 6], u8) {
+    let expanded = expand_repeat(value);
+    let mut tracks = [None; 6];
+    let mut count = 0u8;
+    for token in expanded.split_whitespace() {
+        if count as usize >= tracks.len() {
+            break;
+        }
+        let Some(track) = parse_track(token) else {
+            continue;
+        };
+        tracks[count as usize] = Some(track);
+        count += 1;
+    }
+    (tracks, count)
+}
+
+fn expand_repeat(value: &str) -> String {
+    let Some(start) = value.find("repeat(") else {
+        return value.to_string();
+    };
+    let after = &value[start + "repeat(".len()..];
+    let Some(end) = after.find(')') else {
+        return value.to_string();
+    };
+    let inner = &after[..end];
+    let Some((count, track)) = inner.split_once(',') else {
+        return value.to_string();
+    };
+    let Ok(count) = count.trim().parse::<usize>() else {
+        return value.to_string();
+    };
+    let track = track.trim();
+    let repeated = std::iter::repeat_n(track, count.min(6)).collect::<Vec<_>>().join(" ");
+    format!("{}{repeated}{}", &value[..start], &after[end + 1..])
+}
+
+fn parse_track(token: &str) -> Option<Track> {
+    if let Some(number) = token.strip_suffix("fr") {
+        return Some(Track::Fr(number.trim().parse().ok()?));
+    }
+    match parse_length(token)? {
+        Length::Px(n) => Some(Track::Px(n)),
+        Length::Percent(n) => Some(Track::Percent(n)),
+        _ => None,
     }
 }
 
@@ -590,12 +1108,12 @@ mod tests {
 
     fn body_style(html: &str, viewport: Viewport) -> Computed {
         let doc = parse(html);
-        let sheet = stylesheet(&doc);
+        let sheet = stylesheet(&doc, None);
         let body = doc.nodes.iter().find_map(|node| match &node.data {
             NodeData::Element { tag, attrs } if tag == "body" => Some(attrs.clone()),
             _ => None,
         });
-        compute("body", body.as_deref().unwrap_or(&[]), &root_style(), &sheet, viewport, 800.0)
+        compute("body", body.as_deref().unwrap_or(&[]), &[], &root_style(), &sheet, viewport, 800.0)
     }
 
     #[test]
@@ -620,7 +1138,7 @@ mod tests {
             NodeData::Element { attrs, .. } => attrs.clone(),
             _ => panic!("missing h1"),
         };
-        let style = compute("h1", &attrs, &root_style(), &stylesheet(&doc), Viewport { width: 800.0, height: 600.0 }, 800.0);
+        let style = compute("h1", &attrs, &[], &root_style(), &stylesheet(&doc, None), Viewport { width: 800.0, height: 600.0 }, 800.0);
         assert!((style.font_size - 32.0).abs() < 0.1);
         assert_eq!(style.display, Display::Block);
     }
@@ -631,6 +1149,7 @@ mod tests {
         let hidden = compute(
             "p",
             &[("style".into(), "display:none".into())],
+            &[],
             &parent,
             &Stylesheet { rules: Vec::new() },
             Viewport { width: 100.0, height: 100.0 },
@@ -640,11 +1159,28 @@ mod tests {
         let link = compute(
             "a",
             &[],
+            &[],
             &parent,
             &Stylesheet { rules: Vec::new() },
             Viewport { width: 100.0, height: 100.0 },
             100.0,
         );
         assert_eq!(link.color.as_rgba(), [0x1A, 0x0D, 0xAB, 255]);
+    }
+
+    #[test]
+    fn class_selector_and_linked_stylesheet() {
+        let doc = parse(r#"<link rel="stylesheet" href="site.css"><p class="title">Hi</p>"#);
+        let sheet = stylesheet_with(&doc, Some("https://example.com/"), &|url| {
+            assert_eq!(url, "https://example.com/site.css");
+            Ok(".title { color: #010203; display: flex }".to_string())
+        });
+        let attrs = match &doc.nodes.iter().find(|node| matches!(&node.data, NodeData::Element { tag, .. } if tag == "p")).unwrap().data {
+            NodeData::Element { attrs, .. } => attrs.clone(),
+            _ => unreachable!(),
+        };
+        let style = compute("p", &attrs, &[], &root_style(), &sheet, Viewport { width: 800.0, height: 600.0 }, 800.0);
+        assert_eq!(style.color.as_rgba(), [1, 2, 3, 255]);
+        assert_eq!(style.display, Display::Flex);
     }
 }

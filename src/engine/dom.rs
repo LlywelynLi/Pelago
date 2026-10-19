@@ -51,4 +51,66 @@ impl Document {
         self.nodes[parent.0].children.push(id);
         id
     }
+
+    pub fn create(&mut self, data: NodeData) -> NodeId {
+        let id = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            data,
+            parent: None,
+            children: Vec::new(),
+        });
+        id
+    }
+
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        if parent.0 >= self.nodes.len() || child.0 >= self.nodes.len() || parent == child {
+            return;
+        }
+        if let Some(old) = self.nodes[child.0].parent {
+            self.nodes[old.0].children.retain(|id| *id != child);
+        }
+        self.nodes[child.0].parent = Some(parent);
+        self.nodes[parent.0].children.push(child);
+    }
+
+    pub fn clear_children(&mut self, id: NodeId) {
+        let children = std::mem::take(&mut self.nodes[id.0].children);
+        for child in children {
+            self.nodes[child.0].parent = None;
+        }
+    }
+
+    pub fn set_text(&mut self, id: NodeId, text: String) {
+        self.clear_children(id);
+        self.push(NodeData::Text(text), id);
+    }
+
+    pub fn text_content(&self, id: NodeId) -> String {
+        match &self.nodes[id.0].data {
+            NodeData::Text(text) => text.clone(),
+            NodeData::Element { .. } | NodeData::Document => self.nodes[id.0]
+                .children
+                .iter()
+                .map(|child| self.text_content(*child))
+                .collect(),
+        }
+    }
+
+    pub fn set_attr(&mut self, id: NodeId, name: &str, value: String) {
+        let NodeData::Element { attrs, .. } = &mut self.nodes[id.0].data else {
+            return;
+        };
+        if let Some((_, slot)) = attrs.iter_mut().find(|(key, _)| key.eq_ignore_ascii_case(name)) {
+            *slot = value;
+        } else {
+            attrs.push((name.to_string(), value));
+        }
+    }
+
+    pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
+        let NodeData::Element { attrs, .. } = &self.nodes[id.0].data else {
+            return None;
+        };
+        attrs.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
+    }
 }

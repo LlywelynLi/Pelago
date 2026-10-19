@@ -2,7 +2,7 @@ use cosmic_text::{Align, Attrs, Buffer, Color, FontSystem, Metrics, Shaping, Und
 
 use crate::engine::dom::{Document, NodeData, NodeId};
 use crate::engine::image::{Bitmap, ImageStore};
-use crate::engine::style::{self, Computed, Display, Stylesheet, TextAlign, Viewport};
+use crate::engine::style::{self, Computed, Display, ElemSnap, FlexDirection, FloatSide, Justify, Position, Stylesheet, TextAlign, Track, Viewport};
 use crate::net::url::resolve_url;
 
 const LINE_SCALE: f32 = 1.4;
@@ -76,7 +76,7 @@ pub fn layout(
     images: &mut ImageStore,
     font_system: &mut FontSystem,
 ) -> Scene {
-    let sheet = style::stylesheet(doc);
+    let sheet = style::stylesheet(doc, base_url);
     let viewport = Viewport {
         width: viewport_width,
         height: viewport_height,
@@ -93,7 +93,11 @@ pub fn layout(
         base_url,
         images,
         link: None,
+        float_x: 0.0,
+        float_origin_y: -1.0,
+        float_bottom: 0.0,
     };
+    let mut ancestors = Vec::new();
     let bottom = layout_block_children(
         doc,
         doc.root(),
@@ -107,6 +111,7 @@ pub fn layout(
         &mut scene,
         font_system,
         &mut flow,
+        &mut ancestors,
     );
     scene.height = bottom.max(0.0);
     scene
@@ -116,6 +121,9 @@ struct Flow<'a> {
     base_url: Option<&'a str>,
     images: &'a mut ImageStore,
     link: Option<String>,
+    float_x: f32,
+    float_origin_y: f32,
+    float_bottom: f32,
 }
 
 pub fn clamp_scroll(scroll: f32, content_height: f32, view_height: f32) -> f32 {
@@ -320,7 +328,18 @@ fn layout_block_children(
     scene: &mut Scene,
     font_system: &mut FontSystem,
     flow: &mut Flow<'_>,
+    ancestors: &mut Vec<ElemSnap>,
 ) -> f32 {
+    if parent_style.display == Display::Flex {
+        return layout_flex(doc, parent, x, y, width, preserve, parent_style, sheet, viewport, scene, font_system, flow, ancestors);
+    }
+    if parent_style.display == Display::Grid {
+        return layout_grid(doc, parent, x, y, width, preserve, parent_style, sheet, viewport, scene, font_system, flow, ancestors);
+    }
+    let saved = (flow.float_x, flow.float_origin_y, flow.float_bottom);
+    flow.float_x = x;
+    flow.float_origin_y = -1.0;
+    flow.float_bottom = y;
     let mut inline = InlineBuilder::new();
     y = walk(
         doc,
@@ -336,8 +355,14 @@ fn layout_block_children(
         font_system,
         flow,
         &mut inline,
+        ancestors,
     );
-    inline.finish(x, y, width, parent_style.text_align, flow.link.clone(), font_system, scene)
+    y = inline.finish(x, y, width, parent_style.text_align, flow.link.clone(), font_system, scene);
+    y = y.max(flow.float_bottom);
+    flow.float_x = saved.0;
+    flow.float_origin_y = saved.1;
+    flow.float_bottom = saved.2;
+    y
 }
 
 fn walk(
@@ -354,6 +379,7 @@ fn walk(
     font_system: &mut FontSystem,
     flow: &mut Flow<'_>,
     inline: &mut InlineBuilder,
+    ancestors: &mut Vec<ElemSnap>,
 ) -> f32 {
     for child in doc.nodes[parent.0].children.clone() {
         match &doc.nodes[child.0].data {
@@ -366,8 +392,33 @@ fn walk(
                     inline.newline();
                     continue;
                 }
-                let style = style::compute(&tag, &attrs, parent_style, sheet, viewport, width);
+                let style = style::compute(&tag, &attrs, ancestors, parent_style, sheet, viewport, width);
                 if style.display == Display::None {
+                    continue;
+                }
+                if style.position == Position::Absolute {
+                    let ax = x + style.left.unwrap_or(0.0);
+                    let ay = y + style.top.unwrap_or(0.0);
+                    let aw = style.width.unwrap_or(width).min(width.max(style.width.unwrap_or(width)));
+                    let _ = layout_block(doc, child, &tag, &attrs, &style, ax, ay, aw, preserve, sheet, viewport, scene, font_system, flow, ancestors);
+                    continue;
+                }
+                if style.float != FloatSide::None {
+                    y = inline.finish(x, y, width, parent_style.text_align, flow.link.clone(), font_system, scene);
+                    if (flow.float_origin_y - y).abs() > 0.5 {
+                        flow.float_x = x;
+                        flow.float_origin_y = y;
+                    }
+                    let pref = style.width.unwrap_or_else(|| estimate_width(doc, child, &style)).clamp(1.0, width);
+                    let place_x = if style.float == FloatSide::Right {
+                        x + width - pref
+                    } else {
+                        let place = flow.float_x;
+                        flow.float_x += pref + parent_style.gap.max(8.0);
+                        place
+                    };
+                    let bottom = layout_block(doc, child, &tag, &attrs, &style, place_x, y, pref, preserve, sheet, viewport, scene, font_system, flow, ancestors);
+                    flow.float_bottom = flow.float_bottom.max(bottom);
                     continue;
                 }
                 if tag == "img" {
@@ -394,6 +445,7 @@ fn walk(
                         font_system,
                         flow,
                         &mut inner,
+                        ancestors,
                     );
                     y = inner.finish(x, y, width, style.text_align, flow.link.clone(), font_system, scene);
                     flow.link = previous;
@@ -401,7 +453,7 @@ fn walk(
                 }
                 match style.display {
                     Display::None => {}
-                    Display::Inline => {
+                    Display::Inline | Display::InlineBlock => {
                         y = walk(
                             doc,
                             child,
@@ -416,14 +468,21 @@ fn walk(
                             font_system,
                             flow,
                             inline,
+                            ancestors,
                         );
                     }
-                    Display::Block => {
+                    Display::Block | Display::Flex | Display::Grid => {
                         y = inline.finish(x, y, width, parent_style.text_align, flow.link.clone(), font_system, scene);
+                        if flow.float_bottom > y {
+                            y = flow.float_bottom;
+                            flow.float_x = x;
+                            flow.float_origin_y = -1.0;
+                        }
                         y = layout_block(
                             doc,
                             child,
                             &tag,
+                            &attrs,
                             &style,
                             x,
                             y,
@@ -434,6 +493,7 @@ fn walk(
                             scene,
                             font_system,
                             flow,
+                            ancestors,
                         );
                     }
                 }
@@ -447,6 +507,7 @@ fn layout_block(
     doc: &Document,
     id: NodeId,
     tag: &str,
+    attrs: &[(String, String)],
     style: &Computed,
     x: f32,
     y: f32,
@@ -457,6 +518,7 @@ fn layout_block(
     scene: &mut Scene,
     font_system: &mut FontSystem,
     flow: &mut Flow<'_>,
+    ancestors: &mut Vec<ElemSnap>,
 ) -> f32 {
     let [mt, mr, mb, ml] = style.margin;
     let [pt, pr, pb, pl] = style.padding;
@@ -484,6 +546,10 @@ fn layout_block(
             }
         }
     }
+    ancestors.push(ElemSnap {
+        tag: tag.to_string(),
+        attrs: attrs.to_vec(),
+    });
     let content_bottom = layout_block_children(
         doc,
         id,
@@ -497,7 +563,9 @@ fn layout_block(
         scene,
         font_system,
         flow,
+        ancestors,
     );
+    ancestors.pop();
     let border_bottom = content_bottom + pb;
     if let Some(index) = fill_index {
         scene.fills[index].h = (border_bottom - top).max(0.0);
@@ -559,6 +627,189 @@ fn image_size(bitmap: &Bitmap, width_attr: Option<&str>, height_attr: Option<&st
 fn parse_px(value: &str) -> Option<f32> {
     let number: f32 = value.trim().trim_end_matches("px").trim().parse().ok()?;
     if number > 0.0 { Some(number) } else { None }
+}
+
+fn layout_flex(
+    doc: &Document,
+    parent: NodeId,
+    x: f32,
+    y: f32,
+    width: f32,
+    preserve: bool,
+    parent_style: &Computed,
+    sheet: &Stylesheet,
+    viewport: Viewport,
+    scene: &mut Scene,
+    font_system: &mut FontSystem,
+    flow: &mut Flow<'_>,
+    ancestors: &mut Vec<ElemSnap>,
+) -> f32 {
+    let items = flex_items(doc, parent, ancestors, parent_style, sheet, viewport, width);
+    if items.is_empty() {
+        return y;
+    }
+    if parent_style.flex_direction == FlexDirection::Column {
+        let mut cursor = y;
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                cursor += parent_style.gap;
+            }
+            let item_w = item.style.width.unwrap_or(width).min(width).max(1.0);
+            cursor = layout_block(doc, item.id, &item.tag, &item.attrs, &item.style, x, cursor, item_w, preserve, sheet, viewport, scene, font_system, flow, ancestors);
+        }
+        return cursor;
+    }
+    let count = items.len();
+    let gap = parent_style.gap;
+    let mut widths: Vec<f32> = items.iter().map(|item| item.pref).collect();
+    let base_gaps = gap * (count.saturating_sub(1)) as f32;
+    let extra = width - (widths.iter().sum::<f32>() + base_gaps);
+    let mut offset = 0.0;
+    let mut used_gap = gap;
+    if extra > 1.0 {
+        let grow: f32 = items.iter().map(|item| item.style.flex_grow).sum();
+        if grow > 0.0 {
+            for (slot, item) in widths.iter_mut().zip(items.iter()) {
+                *slot += extra * item.style.flex_grow / grow;
+            }
+        } else {
+            match parent_style.justify_content {
+                Justify::Center => offset = extra / 2.0,
+                Justify::End => offset = extra,
+                Justify::SpaceBetween if count > 1 => used_gap = gap + extra / (count - 1) as f32,
+                Justify::Start | Justify::SpaceBetween => {}
+            }
+        }
+    } else if extra < -1.0 {
+        let content = widths.iter().sum::<f32>().max(1.0);
+        let scale = (width - base_gaps).max(0.0) / content;
+        for slot in &mut widths {
+            *slot = (*slot * scale).max(1.0);
+        }
+    }
+    let mut cursor = x + offset;
+    let mut bottom = y;
+    for (index, item) in items.iter().enumerate() {
+        let item_bottom = layout_block(doc, item.id, &item.tag, &item.attrs, &item.style, cursor, y, widths[index], preserve, sheet, viewport, scene, font_system, flow, ancestors);
+        bottom = bottom.max(item_bottom);
+        cursor += widths[index] + used_gap;
+    }
+    bottom
+}
+
+fn layout_grid(
+    doc: &Document,
+    parent: NodeId,
+    x: f32,
+    y: f32,
+    width: f32,
+    preserve: bool,
+    parent_style: &Computed,
+    sheet: &Stylesheet,
+    viewport: Viewport,
+    scene: &mut Scene,
+    font_system: &mut FontSystem,
+    flow: &mut Flow<'_>,
+    ancestors: &mut Vec<ElemSnap>,
+) -> f32 {
+    let items = flex_items(doc, parent, ancestors, parent_style, sheet, viewport, width);
+    if items.is_empty() {
+        return y;
+    }
+    let columns = grid_column_widths(parent_style, width);
+    let column_count = columns.len().max(1);
+    let gap = parent_style.gap;
+    let mut cursor_y = y;
+    let mut row_height = 0.0;
+    for (index, item) in items.iter().enumerate() {
+        let column = index % column_count;
+        if column == 0 && index > 0 {
+            cursor_y += row_height + gap;
+            row_height = 0.0;
+        }
+        let mut cursor_x = x;
+        for earlier in 0..column {
+            cursor_x += columns[earlier] + gap;
+        }
+        let bottom = layout_block(doc, item.id, &item.tag, &item.attrs, &item.style, cursor_x, cursor_y, columns[column], preserve, sheet, viewport, scene, font_system, flow, ancestors);
+        row_height = row_height.max(bottom - cursor_y);
+    }
+    cursor_y + row_height
+}
+
+struct FlexItem {
+    id: NodeId,
+    tag: String,
+    attrs: Vec<(String, String)>,
+    style: Computed,
+    pref: f32,
+}
+
+fn flex_items(
+    doc: &Document,
+    parent: NodeId,
+    ancestors: &[ElemSnap],
+    parent_style: &Computed,
+    sheet: &Stylesheet,
+    viewport: Viewport,
+    width: f32,
+) -> Vec<FlexItem> {
+    let mut items = Vec::new();
+    for child in doc.nodes[parent.0].children.clone() {
+        let NodeData::Element { tag, attrs } = &doc.nodes[child.0].data else {
+            continue;
+        };
+        let style = style::compute(tag, attrs, ancestors, parent_style, sheet, viewport, width);
+        if style.display == Display::None {
+            continue;
+        }
+        let pref = style.width.unwrap_or_else(|| estimate_width(doc, child, &style)).max(1.0);
+        items.push(FlexItem {
+            id: child,
+            tag: tag.clone(),
+            attrs: attrs.clone(),
+            style,
+            pref,
+        });
+    }
+    items
+}
+
+fn grid_column_widths(style: &Computed, width: f32) -> Vec<f32> {
+    let count = if style.grid_column_count == 0 { 1 } else { style.grid_column_count as usize };
+    let gap = style.gap * (count.saturating_sub(1)) as f32;
+    let available = (width - gap).max(1.0);
+    let mut fixed = 0.0;
+    let mut fr = 0.0;
+    for index in 0..count {
+        match style.grid_columns.get(index).and_then(|track| *track) {
+            Some(Track::Px(value)) => fixed += value,
+            Some(Track::Percent(value)) => fixed += value / 100.0 * width,
+            Some(Track::Fr(value)) => fr += value,
+            None => fr += 1.0,
+        }
+    }
+    let fr_px = if fr > 0.0 { (available - fixed).max(0.0) / fr } else { 0.0 };
+    (0..count)
+        .map(|index| match style.grid_columns.get(index).and_then(|track| *track) {
+            Some(Track::Px(value)) => value.max(1.0),
+            Some(Track::Percent(value)) => (value / 100.0 * width).max(1.0),
+            Some(Track::Fr(value)) => (value * fr_px).max(1.0),
+            None => fr_px.max(1.0),
+        })
+        .collect()
+}
+
+fn estimate_width(doc: &Document, id: NodeId, style: &Computed) -> f32 {
+    let chars = count_chars(doc, id) as f32;
+    chars * style.font_size * 0.55 + style.padding[1] + style.padding[3] + 12.0
+}
+
+fn count_chars(doc: &Document, id: NodeId) -> usize {
+    match &doc.nodes[id.0].data {
+        NodeData::Text(text) => text.chars().filter(|ch| !ch.is_whitespace()).count(),
+        NodeData::Element { .. } | NodeData::Document => doc.nodes[id.0].children.iter().map(|child| count_chars(doc, *child)).sum(),
+    }
 }
 
 fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -625,6 +876,46 @@ mod tests {
         let scene = lay_out(&format!(r#"<img src="data:image/png;base64,{encoded}" width="8" height="4">"#), 200.0, 200.0, None);
         assert_eq!(scene.images.len(), 1);
         assert_eq!((scene.images[0].w, scene.images[0].h), (8.0, 4.0));
+    }
+
+    #[test]
+    fn flex_row_places_items_side_by_side() {
+        let scene = lay_out(
+            r#"<style>.nav{display:flex;gap:12px}</style><div class="nav"><span>新闻</span><span>地图</span></div>"#,
+            640.0,
+            200.0,
+            None,
+        );
+        let news = scene.texts.iter().find(|text| text.text.contains("新闻")).unwrap();
+        let maps = scene.texts.iter().find(|text| text.text.contains("地图")).unwrap();
+        assert!((news.y - maps.y).abs() < 2.0, "news.y={} maps.y={}", news.y, maps.y);
+        assert!(maps.x > news.x, "news.x={} maps.x={}", news.x, maps.x);
+    }
+
+    #[test]
+    fn grid_and_float_and_absolute() {
+        let scene = lay_out(
+            r#"<style>
+                .grid{display:grid;grid-template-columns:100px 100px;gap:0}
+                .left{float:left;width:80px}
+                .right{float:left;width:80px}
+                .abs{position:absolute;left:10px;top:10px}
+            </style>
+            <div class="grid"><span>A</span><span>B</span></div>
+            <div><span class="left">L</span><span class="right">R</span></div>
+            <div class="abs">Z</div>"#,
+            400.0,
+            300.0,
+            None,
+        );
+        let a = scene.texts.iter().find(|text| text.text.contains('A')).unwrap();
+        let b = scene.texts.iter().find(|text| text.text.contains('B')).unwrap();
+        assert!(b.x > a.x + 40.0, "a.x={} b.x={}", a.x, b.x);
+        let left = scene.texts.iter().find(|text| text.text.contains('L')).unwrap();
+        let right = scene.texts.iter().find(|text| text.text.contains('R')).unwrap();
+        assert!(right.x > left.x, "left.x={} right.x={}", left.x, right.x);
+        let abs = scene.texts.iter().find(|text| text.text.contains('Z')).unwrap();
+        assert!(abs.x < 40.0, "abs.x={}", abs.x);
     }
 
     #[test]

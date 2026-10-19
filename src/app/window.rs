@@ -164,9 +164,9 @@ impl App {
     fn load_initial(&mut self) {
         match &self.source {
             PageSource::Html(html) => {
-                let doc = parse(html);
+                let mut doc = parse(html);
                 // 无真实 URL 时仍执行脚本，但忽略导航请求。
-                let _ = js::run_inline_scripts(&doc, "about:blank");
+                let _ = js::run_inline_scripts(&mut doc, "about:blank");
                 self.document.replace(doc);
                 self.current_url = None;
                 self.address.clear();
@@ -213,7 +213,7 @@ impl App {
 
         let navigation = self
             .document
-            .as_ref()
+            .as_mut()
             .and_then(|doc| js::run_inline_scripts(doc, &url));
         let Some(nav) = navigation else {
             return;
