@@ -1,4 +1,4 @@
-use crate::dom::{Document, NodeData, NodeId};
+use crate::engine::dom::{Document, NodeData, NodeId};
 
 const VOID_TAGS: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",

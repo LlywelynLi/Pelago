@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::dom::{Document, NodeData, NodeId};
+use crate::engine::dom::{Document, NodeData, NodeId};
 
 pub fn text_runs(doc: &Document) -> Vec<String> {
     let mut collector = Collector {
@@ -146,7 +146,7 @@ fn collapse_inner(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html::parse;
+    use crate::engine::html::parse;
 
     #[test]
     fn block_breaks_skip_head_and_collapse_space() {

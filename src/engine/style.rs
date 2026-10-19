@@ -1,6 +1,6 @@
 use cosmic_text::Color;
 
-use crate::dom::{Document, NodeData};
+use crate::engine::dom::{Document, NodeData};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
@@ -586,7 +586,7 @@ fn strip_comments(css: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html::parse;
+    use crate::engine::html::parse;
 
     fn body_style(html: &str, viewport: Viewport) -> Computed {
         let doc = parse(html);

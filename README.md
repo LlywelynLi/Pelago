@@ -2,6 +2,16 @@
 
 用 Rust 写的简易网页浏览器。打开一个 URL，或直接渲染一段 HTML。
 
+## 结构
+
+```
+src/
+  main.rs          # 入口与命令行
+  app/             # 窗口、地址栏等 UI
+  engine/          # DOM / HTML / CSS / 布局 / 绘制 / 图片 / JS
+  net/             # HTTP 拉取与 URL 工具
+```
+
 ## 用法
 
 ```

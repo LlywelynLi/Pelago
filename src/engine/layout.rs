@@ -1,9 +1,9 @@
 use cosmic_text::{Align, Attrs, Buffer, Color, FontSystem, Metrics, Shaping, UnderlineStyle, Wrap};
 
-use crate::dom::{Document, NodeData, NodeId};
-use crate::image::{Bitmap, ImageStore};
-use crate::style::{self, Computed, Display, Stylesheet, TextAlign, Viewport};
-use crate::urlutil::resolve_url;
+use crate::engine::dom::{Document, NodeData, NodeId};
+use crate::engine::image::{Bitmap, ImageStore};
+use crate::engine::style::{self, Computed, Display, Stylesheet, TextAlign, Viewport};
+use crate::net::url::resolve_url;
 
 const LINE_SCALE: f32 = 1.4;
 
@@ -568,7 +568,7 @@ fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html::parse;
+    use crate::engine::html::parse;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 
     fn lay_out(html: &str, width: f32, height: f32, base: Option<&str>) -> Scene {

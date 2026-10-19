@@ -1,17 +1,8 @@
-mod chrome;
-mod dom;
-mod html;
-mod image;
-mod js;
-mod layout;
+mod app;
+mod engine;
 mod net;
-mod paint;
-mod style;
-mod text;
-mod urlutil;
-mod window;
 
-use window::PageSource;
+use app::PageSource;
 
 const HOME_HTML: &str = r#"<!doctype html>
 <html>
@@ -42,7 +33,7 @@ fn main() {
         None => PageSource::Html(HOME_HTML.to_string()),
     };
 
-    if let Err(err) = window::open(source) {
+    if let Err(err) = app::open(source) {
         eprintln!("{err}");
         std::process::exit(1);
     }

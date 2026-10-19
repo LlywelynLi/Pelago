@@ -1,6 +1,6 @@
 use cosmic_text::{Color, FontSystem, SwashCache};
 
-use crate::layout::{ImageBox, Scene};
+use crate::engine::layout::{ImageBox, Scene};
 
 pub fn paint_scene(
     scene: &mut Scene,
@@ -135,15 +135,15 @@ fn blend(dst: u32, src: Color) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html::parse;
-    use crate::layout::layout;
+    use crate::engine::html::parse;
+    use crate::engine::layout::layout;
 
     #[test]
     fn draws_styled_text_and_scrolls_it_away() {
         let doc = parse("<h1 style=\"color:#000\">Hi 你好</h1>");
         let mut font_system = FontSystem::new();
         let mut cache = SwashCache::new();
-        let mut images = crate::image::ImageStore::new();
+        let mut images = crate::engine::image::ImageStore::new();
         let mut scene = layout(&doc, 320.0, 200.0, None, &mut images, &mut font_system);
         let width = 320;
         let height = 120;

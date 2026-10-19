@@ -10,15 +10,15 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::chrome::{self, BarHit, Chrome};
-use crate::dom::Document;
-use crate::html::parse;
-use crate::image::ImageStore;
-use crate::js::{self, NavigationKind};
-use crate::layout::{clamp_scroll, layout, Scene};
+use super::chrome::{self, BarHit, Chrome};
+use crate::engine::dom::Document;
+use crate::engine::html::parse;
+use crate::engine::image::ImageStore;
+use crate::engine::js::{self, NavigationKind};
+use crate::engine::layout::{clamp_scroll, layout, Scene};
+use crate::engine::paint::paint_scene;
 use crate::net::fetch;
-use crate::paint::paint_scene;
-use crate::urlutil::normalize_navigation;
+use crate::net::url::normalize_navigation;
 
 const WHEEL_STEP: f32 = 48.0;
 const MAX_JS_REDIRECTS: u32 = 5;

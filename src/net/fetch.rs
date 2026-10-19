@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn fetches_example_domain() {
         let page = fetch("https://example.com").expect("example.com");
-        let runs = crate::text::text_runs(&crate::html::parse(&page.html));
+        let runs = crate::engine::text::text_runs(&crate::engine::html::parse(&page.html));
         assert!(
             runs.iter().any(|line| line.contains("documentation examples")),
             "正文里没有页面文字：{runs:?}"

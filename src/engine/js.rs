@@ -5,8 +5,8 @@ use boa_engine::object::ObjectInitializer;
 use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsArgs, JsResult, JsString, JsValue, NativeFunction, Source};
 
-use crate::dom::{Document, NodeData, NodeId};
-use crate::urlutil::{normalize_navigation, resolve_url};
+use crate::engine::dom::{Document, NodeData, NodeId};
+use crate::net::url::{normalize_navigation, resolve_url};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavigationKind {
@@ -213,7 +213,7 @@ fn queue_navigation(state: &Rc<RefCell<NavState>>, base: &str, raw: &str, kind: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html::parse;
+    use crate::engine::html::parse;
 
     #[test]
     fn baidu_style_https_to_http_replace() {
