@@ -5,9 +5,18 @@
 ## 用法
 
 ```
+cargo run
 cargo run -- <url>
 cargo run -- --html "<html>"
 ```
+
+不带参数时会打开欢迎页，可在地址栏输入网址继续浏览。
+
+## JavaScript
+
+内嵌 [Boa](https://boajs.dev/) 引擎，会执行页面中的**内联** `<script>`，并提供最小 `location` API（`href` / `assign` / `replace`）。
+
+当前不支持完整 DOM、外部 `<script src>`、事件与定时器。
 
 ## 构建
 

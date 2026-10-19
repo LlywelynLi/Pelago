@@ -14,12 +14,14 @@ use crate::chrome::{self, BarHit, Chrome};
 use crate::dom::Document;
 use crate::html::parse;
 use crate::image::ImageStore;
+use crate::js::{self, NavigationKind};
 use crate::layout::{clamp_scroll, layout, Scene};
 use crate::net::fetch;
 use crate::paint::paint_scene;
 use crate::urlutil::normalize_navigation;
 
 const WHEEL_STEP: f32 = 48.0;
+const MAX_JS_REDIRECTS: u32 = 5;
 
 pub enum PageSource {
     Url(String),
@@ -162,7 +164,10 @@ impl App {
     fn load_initial(&mut self) {
         match &self.source {
             PageSource::Html(html) => {
-                self.document = Some(parse(html));
+                let doc = parse(html);
+                // 无真实 URL 时仍执行脚本，但忽略导航请求。
+                let _ = js::run_inline_scripts(&doc, "about:blank");
+                self.document.replace(doc);
                 self.current_url = None;
                 self.address.clear();
             }
@@ -177,6 +182,10 @@ impl App {
     }
 
     fn open_url(&mut self, raw: &str, record: bool) {
+        self.open_url_limited(raw, record, MAX_JS_REDIRECTS);
+    }
+
+    fn open_url_limited(&mut self, raw: &str, record: bool, redirects_left: u32) {
         let url = match normalize_navigation(raw) {
             Ok(url) => url,
             Err(message) => {
@@ -198,8 +207,30 @@ impl App {
             if self.history_index + 1 < self.history.len() {
                 self.history.truncate(self.history_index + 1);
             }
-            self.history.push(url);
+            self.history.push(url.clone());
             self.history_index = self.history.len() - 1;
+        }
+
+        let navigation = self
+            .document
+            .as_ref()
+            .and_then(|doc| js::run_inline_scripts(doc, &url));
+        let Some(nav) = navigation else {
+            return;
+        };
+        if nav.url == url || redirects_left == 0 {
+            return;
+        }
+        match nav.kind {
+            NavigationKind::Replace => {
+                if let Some(entry) = self.history.get_mut(self.history_index) {
+                    *entry = nav.url.clone();
+                }
+                self.open_url_limited(&nav.url, false, redirects_left - 1);
+            }
+            NavigationKind::Assign => {
+                self.open_url_limited(&nav.url, true, redirects_left - 1);
+            }
         }
     }
 
