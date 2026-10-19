@@ -166,7 +166,7 @@ impl App {
             PageSource::Html(html) => {
                 let mut doc = parse(html);
                 // 无真实 URL 时仍执行脚本，但忽略导航请求。
-                let _ = js::run_inline_scripts(&mut doc, "about:blank");
+                let _ = js::run_inline_scripts(&mut doc, "about:blank").navigation;
                 self.document.replace(doc);
                 self.current_url = None;
                 self.address.clear();
@@ -214,7 +214,8 @@ impl App {
         let navigation = self
             .document
             .as_mut()
-            .and_then(|doc| js::run_inline_scripts(doc, &url));
+            .map(|doc| js::run_inline_scripts(doc, &url).navigation)
+            .flatten();
         let Some(nav) = navigation else {
             return;
         };

@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ptr;
 use std::rc::Rc;
 
@@ -13,6 +14,9 @@ thread_local! {
     static ACTIVE_CONTEXT: Cell<*mut Context> = const { Cell::new(ptr::null_mut()) };
     static ACTIVE_BASE: RefCell<String> = const { RefCell::new(String::new()) };
     static ACTIVE_DOC: Cell<*mut Document> = const { Cell::new(ptr::null_mut()) };
+    static SCRIPT_FAILURES: Cell<u32> = const { Cell::new(0) };
+    static SCRIPT_SAMPLES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static API_MISSES: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,8 +36,47 @@ struct NavState {
     pending: Option<Navigation>,
 }
 
-/// 按文档顺序执行内联和外部 script，返回脚本触发的导航（若有）。
-pub fn run_inline_scripts(doc: &mut Document, base_url: &str) -> Option<Navigation> {
+/// 一次页面脚本运行的结果（供窗口导航与 `--smoke` 验收使用）。
+#[derive(Debug, Default)]
+pub struct ScriptRunResult {
+    pub navigation: Option<Navigation>,
+    pub failures: u32,
+    pub samples: Vec<String>,
+    pub api_misses: Vec<(String, u32)>,
+}
+
+/// 无窗口拉取页面并执行脚本，用于路线图 Phase 0 验收。
+pub fn smoke_page(raw_url: &str) -> Result<ScriptRunResult, String> {
+    let url = normalize_navigation(raw_url)?;
+    eprintln!("smoke: 拉取 {url}");
+    let page = crate::net::fetch(&url).map_err(|err| err.to_string())?;
+    eprintln!("smoke: 已加载 {}", page.final_url);
+    let mut doc = crate::engine::html::parse(&page.html);
+    Ok(run_inline_scripts(&mut doc, &page.final_url))
+}
+
+pub fn print_script_report(result: &ScriptRunResult) {
+    if result.failures > 0 {
+        eprintln!(
+            "页面脚本有 {} 处执行失败（宿主 API 尚不完整）。",
+            result.failures
+        );
+        for sample in &result.samples {
+            eprintln!("  · {sample}");
+        }
+    } else {
+        eprintln!("页面脚本执行完成，无失败。");
+    }
+    if !result.api_misses.is_empty() {
+        eprintln!("未实现 API 访问 Top {}：", result.api_misses.len().min(15));
+        for (name, count) in result.api_misses.iter().take(15) {
+            eprintln!("  · {name} × {count}");
+        }
+    }
+}
+
+/// 按文档顺序执行内联和外部 script。
+pub fn run_inline_scripts(doc: &mut Document, base_url: &str) -> ScriptRunResult {
     run_scripts_with(doc, base_url, &|url| {
         crate::net::fetch_bytes(url, 2 * 1024 * 1024)
             .map(|response| response.bytes)
@@ -45,10 +88,11 @@ pub fn run_scripts_with(
     doc: &mut Document,
     base_url: &str,
     fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>,
-) -> Option<Navigation> {
+) -> ScriptRunResult {
+    reset_script_stats();
     let scripts = collect_scripts(doc, base_url, fetch);
     if scripts.is_empty() {
-        return None;
+        return ScriptRunResult::default();
     }
 
     let state = Rc::new(RefCell::new(NavState {
@@ -59,7 +103,7 @@ pub fn run_scripts_with(
     let mut context = Context::default();
     if let Err(err) = install_location(&mut context, state.clone(), base_url) {
         eprintln!("JS location 初始化失败：{err}");
-        return None;
+        return ScriptRunResult::default();
     }
     let doc_ptr = doc as *mut Document;
     if let Err(err) = install_document(&mut context, doc_ptr) {
@@ -73,19 +117,18 @@ pub fn run_scripts_with(
     ACTIVE_DOC.with(|slot| slot.set(doc_ptr));
     ACTIVE_BASE.with(|slot| *slot.borrow_mut() = base_url.to_string());
 
-    let mut failures = 0u32;
-    let mut samples = Vec::new();
-    for source in scripts {
+    let script_count = scripts.len();
+    for (index, source) in scripts.iter().enumerate() {
+        // 单脚本失败不中断后续脚本（失败隔离）。
         if let Err(err) = context.eval(Source::from_bytes(source.as_bytes())) {
-            failures += 1;
-            if samples.len() < 3 {
-                samples.push(err.to_string());
-            }
+            note_script_failure(&format!("#{}/{}: {err}", index + 1, script_count));
         }
+        drain_timers(&mut context);
     }
     let _ = context.eval(Source::from_bytes(
         br#"
         try {
+          if (typeof __pelagoInstallSjFallback === "function") __pelagoInstallSjFallback();
           document.readyState = "interactive";
           document.dispatchEvent(new Event("DOMContentLoaded"));
           window.dispatchEvent(new Event("DOMContentLoaded"));
@@ -95,18 +138,70 @@ pub fn run_scripts_with(
         } catch (e) {}
         "#,
     ));
+    drain_timers(&mut context);
 
     ACTIVE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
     ACTIVE_DOC.with(|slot| slot.set(ptr::null_mut()));
 
-    if failures > 0 {
-        eprintln!("页面脚本有 {failures} 处执行失败（宿主 API 尚不完整）。");
-        for sample in samples {
-            eprintln!("  · {sample}");
+    let result = ScriptRunResult {
+        navigation: state.borrow_mut().pending.take(),
+        failures: SCRIPT_FAILURES.with(Cell::get),
+        samples: SCRIPT_SAMPLES.with(|slot| slot.borrow().clone()),
+        api_misses: take_api_misses(),
+    };
+    print_script_report(&result);
+    result
+}
+
+fn reset_script_stats() {
+    SCRIPT_FAILURES.with(|slot| slot.set(0));
+    SCRIPT_SAMPLES.with(|slot| slot.borrow_mut().clear());
+    API_MISSES.with(|slot| slot.borrow_mut().clear());
+}
+
+fn note_script_failure(message: &str) {
+    SCRIPT_FAILURES.with(|slot| slot.set(slot.get() + 1));
+    SCRIPT_SAMPLES.with(|slot| {
+        let mut samples = slot.borrow_mut();
+        if samples.len() < 8 {
+            samples.push(message.to_string());
+        }
+    });
+}
+
+fn note_api_miss(name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    API_MISSES.with(|slot| {
+        *slot.borrow_mut().entry(name.to_string()).or_insert(0) += 1;
+    });
+}
+
+fn take_api_misses() -> Vec<(String, u32)> {
+    API_MISSES.with(|slot| {
+        let mut items: Vec<_> = slot.borrow_mut().drain().collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        items
+    })
+}
+
+fn drain_timers(context: &mut Context) {
+    for _ in 0..12 {
+        let Ok(value) = context.eval(Source::from_bytes(
+            br#"
+            (function () {
+              if (typeof __pelagoDrainTimers !== "function") return 0;
+              return __pelagoDrainTimers(96);
+            })()
+            "#,
+        )) else {
+            break;
+        };
+        if value.as_number().unwrap_or(0.0) <= 0.0 {
+            break;
         }
     }
-
-    state.borrow_mut().pending.take()
 }
 
 fn eval_script_source(source: &str) {
@@ -116,7 +211,10 @@ fn eval_script_source(source: &str) {
             return;
         }
         unsafe {
-            let _ = (*ptr).eval(Source::from_bytes(source.as_bytes()));
+            if let Err(err) = (*ptr).eval(Source::from_bytes(source.as_bytes())) {
+                note_script_failure(&err.to_string());
+            }
+            drain_timers(&mut *ptr);
         }
     });
 }
@@ -415,6 +513,7 @@ fn install_document(context: &mut Context, doc: *mut Document) -> JsResult<()> {
         .accessor(js_string!("body"), Some(get_body), None, Attribute::all())
         .accessor(js_string!("documentElement"), Some(get_root), None, Attribute::all())
         .property(js_string!("readyState"), js_string!("loading"), Attribute::all())
+        .property(js_string!("cookie"), js_string!(""), Attribute::all())
         .property(js_string!("nodeType"), 9, Attribute::all())
         .build();
     context.register_global_property(js_string!("document"), document, Attribute::all())?;
@@ -451,6 +550,13 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
         let value = args.get_or_undefined(0).to_string(context)?;
         unsafe { (*doc).set_attr(node, "class", value.to_std_string_escaped()) };
         Ok(JsValue::undefined())
+    });
+    let get_html = NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let html = unsafe { serialize_children(&*doc, node) };
+        Ok(JsValue::from(JsString::from(html.as_str())))
     });
     let set_html = NativeFunction::from_copy_closure(move |this, args, context| {
         let Some(node) = node_id(this, context)? else {
@@ -546,6 +652,7 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
     let set_text = set_text.to_js_function(context.realm());
     let get_class = get_class.to_js_function(context.realm());
     let set_class = set_class.to_js_function(context.realm());
+    let get_html = get_html.to_js_function(context.realm());
     let set_html = set_html.to_js_function(context.realm());
     let get_parent_fn = get_parent.to_js_function(context.realm());
     let get_children_fn = get_children.to_js_function(context.realm());
@@ -555,21 +662,35 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
     let (get_width, set_width) = attr_accessor(doc, "width", context);
     let (get_height, set_height) = attr_accessor(doc, "height", context);
     let style_obj = ObjectInitializer::new(context).build();
+    let class_add = NativeFunction::from_copy_closure(move |_, args, context| {
+        let class = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+        unsafe { class_list_add(&mut *doc, id, &class) };
+        Ok(JsValue::undefined())
+    });
+    let class_remove = NativeFunction::from_copy_closure(move |_, args, context| {
+        let class = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+        unsafe { class_list_remove(&mut *doc, id, &class) };
+        Ok(JsValue::undefined())
+    });
+    let class_toggle = NativeFunction::from_copy_closure(move |_, args, context| {
+        let class = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+        Ok(JsValue::from(unsafe { class_list_toggle(&mut *doc, id, &class) }))
+    });
+    let class_contains = NativeFunction::from_copy_closure(move |_, args, context| {
+        let class = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+        Ok(JsValue::from(unsafe { class_list_contains(&*doc, id, &class) }))
+    });
     let class_list = ObjectInitializer::new(context)
-        .function(noop(), js_string!("add"), 1)
-        .function(noop(), js_string!("remove"), 1)
-        .function(noop(), js_string!("toggle"), 1)
-        .function(
-            NativeFunction::from_copy_closure(|_, _, _| Ok(JsValue::from(false))),
-            js_string!("contains"),
-            1,
-        )
+        .function(class_add, js_string!("add"), 1)
+        .function(class_remove, js_string!("remove"), 1)
+        .function(class_toggle, js_string!("toggle"), 1)
+        .function(class_contains, js_string!("contains"), 1)
         .build();
     let object = ObjectInitializer::new(context)
         .property(js_string!("pelagoId"), id.0 as u32, Attribute::READONLY)
         .accessor(js_string!("textContent"), Some(get_text), Some(set_text), Attribute::all())
         .accessor(js_string!("className"), Some(get_class), Some(set_class), Attribute::all())
-        .accessor(js_string!("innerHTML"), None, Some(set_html), Attribute::all())
+        .accessor(js_string!("innerHTML"), Some(get_html), Some(set_html), Attribute::all())
         .accessor(js_string!("src"), Some(get_src), Some(set_src), Attribute::all())
         .accessor(js_string!("id"), Some(get_id), Some(set_id), Attribute::all())
         .accessor(js_string!("href"), Some(get_href), Some(set_href), Attribute::all())
@@ -668,10 +789,6 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
     Ok(JsValue::from(object))
 }
 
-thread_local! {
-    static TIMER_DEPTH: Cell<u32> = Cell::new(0);
-}
-
 fn attr_accessor(doc: *mut Document, name: &'static str, context: &mut Context) -> (boa_engine::object::builtins::JsFunction, boa_engine::object::builtins::JsFunction) {
     let get = NativeFunction::from_copy_closure(move |this, _, context| {
         let Some(node) = node_id(this, context)? else {
@@ -721,18 +838,19 @@ fn install_host(context: &mut Context, base_url: &str) -> JsResult<()> {
         .property(js_string!("cookieEnabled"), false, Attribute::all())
         .property(js_string!("onLine"), true, Attribute::all())
         .build();
-    let set_timeout = NativeFunction::from_copy_closure(|_, args, context| invoke_timer(args, context));
-    let clear_timeout = noop();
-    let timeout = set_timeout.clone().to_js_function(context.realm());
-    let interval = set_timeout.to_js_function(context.realm());
-    let clear = clear_timeout.clone().to_js_function(context.realm());
-    let clear_interval = clear_timeout.to_js_function(context.realm());
+    let miss = NativeFunction::from_copy_closure(|_, args, context| {
+        let name = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+        note_api_miss(&name);
+        Ok(JsValue::undefined())
+    });
     context.register_global_property(js_string!("console"), console.clone(), Attribute::all())?;
     context.register_global_property(js_string!("navigator"), navigator.clone(), Attribute::all())?;
-    context.register_global_property(js_string!("setTimeout"), timeout.clone(), Attribute::all())?;
-    context.register_global_property(js_string!("setInterval"), interval.clone(), Attribute::all())?;
-    context.register_global_property(js_string!("clearTimeout"), clear, Attribute::all())?;
-    context.register_global_property(js_string!("clearInterval"), clear_interval, Attribute::all())?;
+    // 定时器由 HOST_SHIM 实现队列；这里先占位，随后被 shim 覆盖。
+    let placeholder = noop().to_js_function(context.realm());
+    context.register_global_property(js_string!("setTimeout"), placeholder.clone(), Attribute::all())?;
+    context.register_global_property(js_string!("setInterval"), placeholder.clone(), Attribute::all())?;
+    context.register_global_property(js_string!("clearTimeout"), placeholder.clone(), Attribute::all())?;
+    context.register_global_property(js_string!("clearInterval"), placeholder.clone(), Attribute::all())?;
     let base = base_url.to_string();
     let http = unsafe {
         NativeFunction::from_closure(move |_, args, context| {
@@ -753,6 +871,11 @@ fn install_host(context: &mut Context, base_url: &str) -> JsResult<()> {
         })
     };
     context.register_global_property(js_string!("__pelagoHttp"), http.to_js_function(context.realm()), Attribute::all())?;
+    context.register_global_property(
+        js_string!("__pelagoMiss"),
+        miss.to_js_function(context.realm()),
+        Attribute::all(),
+    )?;
     let load_script = NativeFunction::from_copy_closure(|_, args, context| {
         let value = args.get_or_undefined(0).to_string(context)?;
         load_and_eval_script(&value.to_std_string_escaped());
@@ -766,8 +889,6 @@ fn install_host(context: &mut Context, base_url: &str) -> JsResult<()> {
     if let Some(window) = context.global_object().get(js_string!("window"), context)?.as_object() {
         window.set(js_string!("console"), console, false, context)?;
         window.set(js_string!("navigator"), navigator, false, context)?;
-        window.set(js_string!("setTimeout"), timeout, false, context)?;
-        window.set(js_string!("setInterval"), interval, false, context)?;
         window.set(js_string!("document"), context.global_object().get(js_string!("document"), context)?, false, context)?;
     }
     context.eval(Source::from_bytes(HOST_SHIM))?;
@@ -778,19 +899,65 @@ const HOST_SHIM: &str = r#"
 (function (global) {
   var window = global.window || global;
   function noop() { return undefined; }
-  function soft(value) {
-    if (value == null || typeof value !== "object") return value;
-    if (value.__pelagoSoft) return value;
+  function miss(name) {
+    try { if (typeof __pelagoMiss === "function") __pelagoMiss(String(name)); } catch (e) {}
+  }
+  var __pelagoTimerSeq = 1;
+  var __pelagoTimers = [];
+  var __pelagoCancelled = Object.create(null);
+  function queueTimer(cb, ms, interval) {
+    var id = __pelagoTimerSeq++;
+    __pelagoTimers.push({ id: id, cb: cb, ms: ms | 0, interval: !!interval });
+    return id;
+  }
+  function clearTimer(id) {
+    __pelagoCancelled[id | 0] = true;
+  }
+  global.setTimeout = window.setTimeout = function (cb, ms) { return queueTimer(cb, ms, false); };
+  global.setInterval = window.setInterval = function (cb, ms) { return queueTimer(cb, ms, true); };
+  global.clearTimeout = window.clearTimeout = clearTimer;
+  global.clearInterval = window.clearInterval = clearTimer;
+  global.__pelagoDrainTimers = function (budget) {
+    budget = budget || 64;
+    var ran = 0;
+    var pending = 0;
+    while (ran < budget && __pelagoTimers.length) {
+      var job = __pelagoTimers.shift();
+      if (__pelagoCancelled[job.id]) continue;
+      ran++;
+      try {
+        if (typeof job.cb === "function") job.cb();
+        else if (typeof job.cb === "string") (0, eval)(job.cb);
+      } catch (e) {}
+      if (job.interval && !__pelagoCancelled[job.id]) {
+        __pelagoTimers.push(job);
+        pending++;
+      }
+    }
+    return __pelagoTimers.length + pending > 0 ? __pelagoTimers.length : 0;
+  };
+  function soft(value, label) {
+    if (value == null || (typeof value !== "object" && typeof value !== "function")) return value;
+    try {
+      if (value.__pelagoSoft) return value;
+    } catch (e) {}
+    label = label || "soft";
     try {
       return new Proxy(value, {
         get: function (target, prop, receiver) {
           if (prop === "__pelagoSoft") return true;
-          if (prop in target) {
-            var got = Reflect.get(target, prop, receiver);
-            return typeof got === "function" ? got.bind(target) : soft(got);
+          if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+          var name = String(prop);
+          var got = Reflect.get(target, prop, receiver);
+          var own = Object.prototype.hasOwnProperty.call(target, prop);
+          var proto = Object.getPrototypeOf(target);
+          var onProto = !!(proto && name in proto);
+          if (own || onProto || got !== undefined) {
+            return typeof got === "function" ? got.bind(target) : soft(got, label + "." + name);
           }
-          if (typeof prop === "symbol") return undefined;
-          return function () { return soft({}); };
+          if (name.indexOf("__pelago") === 0) return undefined;
+          miss(label + "." + name);
+          return function () { return soft({}, label + "." + name + "()"); };
         },
         set: function (target, prop, next) {
           try { target[prop] = next; } catch (e) {}
@@ -800,6 +967,32 @@ const HOST_SHIM: &str = r#"
       });
     } catch (e) {
       return value;
+    }
+  }
+  function mirrorGlobal(prop, next) {
+    if (typeof prop !== "string") return;
+    if (prop === "window" || prop === "document" || prop === "globalThis") return;
+    // window.foo = x 时同步到全局绑定，供后续脚本使用裸标识符 foo。
+    try { global[prop] = next; } catch (e) {}
+  }
+  function probe(obj, label) {
+    if (!obj || typeof obj !== "object") return obj;
+    try {
+      return new Proxy(obj, {
+        get: function (target, prop, receiver) {
+          if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+          if (!(prop in target)) miss(label + "." + String(prop));
+          var got = Reflect.get(target, prop, receiver);
+          return typeof got === "function" ? got.bind(target) : got;
+        },
+        set: function (target, prop, next) {
+          try { target[prop] = next; } catch (e) {}
+          mirrorGlobal(prop, next);
+          return true;
+        }
+      });
+    } catch (e) {
+      return obj;
     }
   }
   function wrapNode(node) {
@@ -832,7 +1025,12 @@ const HOST_SHIM: &str = r#"
     };
   }
   function installTarget(obj) {
-    if (!obj || obj.__pelagoEvents) return obj;
+    if (!obj) return obj;
+    try {
+      if (Object.prototype.hasOwnProperty.call(obj, "__pelagoEvents")) return obj;
+    } catch (e) {
+      if (obj.__pelagoEvents) return obj;
+    }
     var map = Object.create(null);
     obj.__pelagoEvents = map;
     obj.addEventListener = function (type, fn) {
@@ -906,10 +1104,61 @@ const HOST_SHIM: &str = r#"
   global.sessionStorage = window.sessionStorage = soft(new Storage());
   global.history = window.history = soft({ pushState: noop, replaceState: noop, back: noop, forward: noop, go: noop, length: 1, state: null });
   global.screen = window.screen = soft({ width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24, pixelDepth: 24 });
-  global.performance = window.performance = soft({ now: function () { return Date.now(); }, timing: soft({}), navigation: soft({}) });
+  var __navStart = Date.now() - 120;
+  global.performance = window.performance = soft({
+    now: function () { return Date.now() - __navStart; },
+    timing: {
+      navigationStart: __navStart,
+      fetchStart: __navStart + 10,
+      domainLookupStart: __navStart + 12,
+      domainLookupEnd: __navStart + 14,
+      connectStart: __navStart + 15,
+      connectEnd: __navStart + 20,
+      requestStart: __navStart + 25,
+      responseStart: __navStart + 40,
+      responseEnd: __navStart + 55,
+      domLoading: __navStart + 60,
+      domInteractive: __navStart + 80,
+      domContentLoadedEventStart: __navStart + 90,
+      domContentLoadedEventEnd: __navStart + 95,
+      domComplete: __navStart + 110,
+      loadEventStart: __navStart + 112,
+      loadEventEnd: __navStart + 115
+    },
+    navigation: { type: 0, redirectCount: 0 }
+  });
+  try {
+    var cookieBox = { value: "" };
+    Object.defineProperty(document, "cookie", {
+      configurable: true,
+      enumerable: true,
+      get: function () { return cookieBox.value; },
+      set: function (next) {
+        next = String(next || "");
+        var part = next.split(";")[0];
+        var eq = part.indexOf("=");
+        if (eq <= 0) return;
+        var key = part.slice(0, eq).trim();
+        var val = part.slice(eq + 1);
+        var pieces = cookieBox.value ? cookieBox.value.split("; ") : [];
+        var found = false;
+        for (var i = 0; i < pieces.length; i++) {
+          if (pieces[i].slice(0, key.length + 1) === key + "=") {
+            pieces[i] = key + "=" + val;
+            found = true;
+            break;
+          }
+        }
+        if (!found) pieces.push(key + "=" + val);
+        cookieBox.value = pieces.join("; ");
+      }
+    });
+  } catch (e) {}
   global.matchMedia = window.matchMedia = function () { return soft({ matches: false, media: "", addListener: noop, removeListener: noop, addEventListener: noop, removeEventListener: noop }); };
   global.getComputedStyle = window.getComputedStyle = function () { return soft({ getPropertyValue: function () { return ""; } }); };
-  global.requestAnimationFrame = window.requestAnimationFrame = function (cb) { return setTimeout(function () { if (typeof cb === "function") cb(Date.now()); }, 0); };
+  global.requestAnimationFrame = window.requestAnimationFrame = function (cb) {
+    return setTimeout(function () { if (typeof cb === "function") cb(Date.now()); }, 0);
+  };
   global.cancelAnimationFrame = window.cancelAnimationFrame = function (id) { clearTimeout(id); };
   global.fetch = window.fetch = function (url, init) {
     init = init || {};
@@ -1114,23 +1363,81 @@ const HOST_SHIM: &str = r#"
   global.$ = global.jQuery = window.$ = window.jQuery = jQuery;
   global.bds = window.bds = window.bds || soft({ util: soft({}), conf: soft({}), event: soft({ on: noop, un: noop, trigger: noop }) });
   global.F = window.F = window.F || soft({});
+
+  // 预置常见 window 事件属性，避免 Boa「uninitialized global property」赋值错误。
+  ["onload", "onerror", "onunhandledrejection", "onresize", "onscroll", "onclick", "onfocus", "onblur"].forEach(function (name) {
+    try {
+      if (typeof global[name] === "undefined") global[name] = null;
+      if (typeof window[name] === "undefined") window[name] = null;
+    } catch (e) {}
+  });
+
+  // 必应等站点把 window/document 缩写成 _w/_d；先挂上避免引导脚本中途 ReferenceError。
+  global._w = window._w = window;
+  global._d = window._d = document;
+  // 预声明 _G，避免外链在 `window._G=...` 之前用 `null==_G` 触发 ReferenceError。
+  // （不可过早提供 sj_be：必应用 `"u">typeof sj_be` 判断，假 stub 会走进依赖 _G 的分支。）
+  if (typeof global._G === "undefined") {
+    global._G = window._G = {};
+  }
+  global.sb_st = window.sb_st = window.sb_st || setTimeout;
+  global.sb_ct = window.sb_ct = window.sb_ct || clearTimeout;
+  global.sb_si = window.sb_si = window.sb_si || setInterval;
+  global.sb_ci = window.sb_ci = window.sb_ci || clearInterval;
+  if (typeof global._ge !== "function") {
+    global._ge = window._ge = function (id) { return document.getElementById(id); };
+  }
+  if (typeof global.sj_gx !== "function") {
+    global.sj_gx = window.sj_gx = function () { return new XMLHttpRequest(); };
+  }
+  // sj_* 在外链真正提供前保持未定义；仅在页面跑完后若仍缺失再补最小实现。
+  global.__pelagoInstallSjFallback = function () {
+    if (typeof global.sj_ce !== "function") {
+      global.sj_ce = window.sj_ce = function (tag, id) {
+        var el = document.createElement(tag || "div");
+        if (id) el.id = id;
+        return el;
+      };
+    }
+    if (typeof global.sj_be !== "function") {
+      global.sj_be = window.sj_be = function (el, type, fn) {
+        if (el && typeof el.addEventListener === "function" && typeof fn === "function") {
+          el.addEventListener(String(type), fn);
+        }
+      };
+    }
+    if (typeof global.sj_ue !== "function") {
+      global.sj_ue = window.sj_ue = function (el, type, fn) {
+        if (el && typeof el.removeEventListener === "function" && typeof fn === "function") {
+          el.removeEventListener(String(type), fn);
+        }
+      };
+    }
+    if (typeof global.sj_evt === "undefined") {
+      global.sj_evt = window.sj_evt = soft({
+        bind: function (type, fn) { window.addEventListener(String(type), fn); },
+        fire: function (type) { window.dispatchEvent(new Event(String(type))); },
+        unbind: function (type, fn) { window.removeEventListener(String(type), fn); }
+      });
+    }
+  };
+
+  // 探针放在 shim 末尾，避免初始化阶段读未定义属性时误伤。
+  try {
+    var probedDocument = probe(document, "document");
+    var probedWindow = probe(window, "window");
+    global.document = probedDocument;
+    global.window = probedWindow;
+    probedWindow.document = probedDocument;
+    probedWindow.window = probedWindow;
+    probedWindow.self = probedWindow;
+    probedWindow.top = probedWindow;
+    probedWindow.parent = probedWindow;
+    global._w = probedWindow._w = probedWindow;
+    global._d = probedWindow._d = probedDocument;
+  } catch (e) {}
 })(typeof globalThis !== "undefined" ? globalThis : (0, eval)("this"));
 "#;
-
-fn invoke_timer(args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(function) = args.get_or_undefined(0).as_callable() else {
-        return Ok(JsValue::from(0));
-    };
-    let depth = TIMER_DEPTH.with(Cell::get);
-    if depth >= 4 {
-        return Ok(JsValue::from(0));
-    }
-    TIMER_DEPTH.with(|slot| slot.set(depth + 1));
-    let result = function.call(&JsValue::undefined(), &[], context);
-    TIMER_DEPTH.with(|slot| slot.set(depth));
-    let _ = result;
-    Ok(JsValue::from(1))
-}
 
 fn elements_by_tag(doc: *mut Document, tag: &str, context: &mut Context) -> JsResult<JsValue> {
     let nodes = unsafe { find_tags(&*doc, tag) };
@@ -1278,6 +1585,110 @@ fn set_inner_html(doc: &mut Document, id: NodeId, html: &str) {
     copy_children(&fragment, fragment.root(), doc, id);
 }
 
+fn serialize_children(doc: &Document, id: NodeId) -> String {
+    let mut out = String::new();
+    for child in &doc.nodes[id.0].children {
+        serialize_node(doc, *child, &mut out);
+    }
+    out
+}
+
+fn serialize_node(doc: &Document, id: NodeId, out: &mut String) {
+    match &doc.nodes[id.0].data {
+        NodeData::Text(text) => out.push_str(&escape_html_text(text)),
+        NodeData::Element { tag, attrs } => {
+            if tag == "#document-fragment" || tag == "!--" {
+                for child in &doc.nodes[id.0].children {
+                    serialize_node(doc, *child, out);
+                }
+                return;
+            }
+            out.push('<');
+            out.push_str(tag);
+            for (name, value) in attrs {
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                out.push_str(&escape_html_attr(value));
+                out.push('"');
+            }
+            if is_void_tag(tag) {
+                out.push_str(" />");
+                return;
+            }
+            out.push('>');
+            for child in &doc.nodes[id.0].children {
+                serialize_node(doc, *child, out);
+            }
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
+        }
+        NodeData::Document => {
+            for child in &doc.nodes[id.0].children {
+                serialize_node(doc, *child, out);
+            }
+        }
+    }
+}
+
+fn escape_html_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_html_attr(text: &str) -> String {
+    escape_html_text(text).replace('"', "&quot;")
+}
+
+fn is_void_tag(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
+            | "param" | "source" | "track" | "wbr"
+    )
+}
+
+fn class_tokens(doc: &Document, id: NodeId) -> Vec<String> {
+    doc.attr(id, "class")
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn class_list_contains(doc: &Document, id: NodeId, class: &str) -> bool {
+    class_tokens(doc, id).iter().any(|item| item == class)
+}
+
+fn class_list_add(doc: &mut Document, id: NodeId, class: &str) {
+    if class.is_empty() || class_list_contains(doc, id, class) {
+        return;
+    }
+    let mut tokens = class_tokens(doc, id);
+    tokens.push(class.to_string());
+    doc.set_attr(id, "class", tokens.join(" "));
+}
+
+fn class_list_remove(doc: &mut Document, id: NodeId, class: &str) {
+    let tokens: Vec<_> = class_tokens(doc, id)
+        .into_iter()
+        .filter(|item| item != class)
+        .collect();
+    doc.set_attr(id, "class", tokens.join(" "));
+}
+
+fn class_list_toggle(doc: &mut Document, id: NodeId, class: &str) -> bool {
+    if class_list_contains(doc, id, class) {
+        class_list_remove(doc, id, class);
+        false
+    } else {
+        class_list_add(doc, id, class);
+        true
+    }
+}
+
 fn copy_children(src: &Document, src_parent: NodeId, dst: &mut Document, dst_parent: NodeId) {
     for child in src.nodes[src_parent.0].children.clone() {
         copy_node(src, child, dst, dst_parent);
@@ -1327,7 +1738,9 @@ mod tests {
             location.replace(location.href.replace("https://","http://"));
         </script></head><body></body></html>"#;
         let mut doc = parse(html);
-        let nav = run_inline_scripts(&mut doc, "https://www.baidu.com/").expect("navigation");
+        let nav = run_inline_scripts(&mut doc, "https://www.baidu.com/")
+            .navigation
+            .expect("navigation");
         assert_eq!(nav.url, "http://www.baidu.com/");
         assert_eq!(nav.kind, NavigationKind::Replace);
     }
@@ -1336,7 +1749,9 @@ mod tests {
     fn location_href_assignment() {
         let html = r#"<script>location.href = "https://example.com/next";</script>"#;
         let mut doc = parse(html);
-        let nav = run_inline_scripts(&mut doc, "https://example.com/").expect("navigation");
+        let nav = run_inline_scripts(&mut doc, "https://example.com/")
+            .navigation
+            .expect("navigation");
         assert_eq!(nav.url, "https://example.com/next");
         assert_eq!(nav.kind, NavigationKind::Assign);
     }
@@ -1349,7 +1764,9 @@ mod tests {
             <script>location.replace("https://example.com/ok");</script>
         "#;
         let mut doc = parse(html);
-        let nav = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("跳过外部脚本".into())).expect("navigation");
+        let nav = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("跳过外部脚本".into()))
+            .navigation
+            .expect("navigation");
         assert_eq!(nav.url, "https://example.com/ok");
     }
 
@@ -1380,8 +1797,8 @@ mod tests {
             }, 0);
             document.body.addEventListener("click", function () {});
         </script></body>"#);
-        let nav = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
-        assert!(nav.is_none());
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert!(result.navigation.is_none());
         let text = doc.text_content(doc.root());
         assert!(text.contains("Win32"), "{text}");
         assert!(!text.contains("old"), "{text}");
@@ -1398,7 +1815,9 @@ mod tests {
                 document.getElementById("msg").textContent = mod.ok + img.src;
             });
         </script></body>"#);
-        assert!(run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into())).is_none());
+        assert!(run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()))
+            .navigation
+            .is_none());
         let text = doc.text_content(doc.root());
         assert!(text.contains("readyhttps://example.com/a.png"), "{text}");
         assert!(doc.nodes.iter().any(|node| matches!(&node.data, NodeData::Element { tag, attrs } if tag == "img" && attrs.iter().any(|(key, value)| key == "src" && value == "https://example.com/a.png"))));
@@ -1415,7 +1834,9 @@ mod tests {
             xhr.send();
             document.getElementById("msg").textContent = xhr.status + " " + xhr.responseText;
         </script></body>"#);
-        assert!(run_scripts_with(&mut doc, "https://example.com/app/", &|_| Err("无外部脚本".into())).is_none());
+        assert!(run_scripts_with(&mut doc, "https://example.com/app/", &|_| Err("无外部脚本".into()))
+            .navigation
+            .is_none());
         let text = doc.text_content(doc.root());
         assert!(text.contains("200 GET /ping"), "{text}");
     }
@@ -1460,12 +1881,134 @@ mod tests {
             box.insertBefore(a, document.getElementById("b"));
             box.removeChild(document.getElementById("b"));
         </script></body>"#);
-        assert!(run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into())).is_none());
+        assert!(run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()))
+            .navigation
+            .is_none());
         let box_id = find_id(&doc, "box").expect("box");
         let kids = doc.element_children(box_id);
         assert_eq!(kids.len(), 1, "kids={kids:?}");
         assert_eq!(doc.attr(kids[0], "id"), Some("a"));
         assert_eq!(doc.text_content(kids[0]), "A");
         assert!(find_id(&doc, "b").is_none());
+    }
+
+    #[test]
+    fn timer_queue_runs_after_script() {
+        let mut doc = parse(
+            r#"<body><p id="msg">0</p><script>
+            setTimeout(function () {
+              document.getElementById("msg").textContent = "1";
+              setTimeout(function () {
+                document.getElementById("msg").textContent = "2";
+              }, 0);
+            }, 0);
+        </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0);
+        assert_eq!(doc.text_content(find_id(&doc, "msg").unwrap()), "2");
+    }
+
+    #[test]
+    fn script_failure_isolation_continues() {
+        let mut doc = parse(
+            r#"<body><p id="msg">x</p>
+            <script>throw new Error("boom");</script>
+            <script>document.getElementById("msg").textContent = "ok";</script>
+            </body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert!(result.failures >= 1);
+        assert_eq!(doc.text_content(find_id(&doc, "msg").unwrap()), "ok");
+    }
+
+    #[test]
+    fn top_level_var_persists_across_scripts() {
+        let mut doc = parse(
+            r#"<body><p id="msg"></p>
+            <script>"use strict"; var _d; typeof _d=="undefined"&&(_d=document);</script>
+            <script>"use strict"; document.getElementById("msg").textContent = typeof _d;</script>
+            </body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        assert_eq!(doc.text_content(find_id(&doc, "msg").unwrap()), "object");
+    }
+
+    #[test]
+    fn top_level_var_survives_later_throw() {
+        let mut doc = parse(
+            r#"<body><p id="msg"></p>
+            <script>"use strict"; var marker; marker=document; notDefinedAtAll.x = 1;</script>
+            <script>"use strict"; document.getElementById("msg").textContent = typeof marker;</script>
+            </body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert!(result.failures >= 1, "samples={:?}", result.samples);
+        assert_eq!(doc.text_content(find_id(&doc, "msg").unwrap()), "object");
+    }
+
+    #[test]
+    fn api_miss_probe_records_unknown_props() {
+        let mut doc = parse(
+            r#"<body><script>
+            void document.pelagoDefinitelyMissing;
+            void window.pelagoAlsoMissing;
+        </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert!(
+            result
+                .api_misses
+                .iter()
+                .any(|(name, _)| name.contains("pelagoDefinitelyMissing") || name.contains("pelagoAlsoMissing")),
+            "misses={:?}",
+            result.api_misses
+        );
+    }
+
+    #[test]
+    fn inner_html_get_and_class_list() {
+        let mut doc = parse(
+            r#"<body><div id="box" class="a"><span>x</span></div><script>
+            var box = document.getElementById("box");
+            box.classList.add("b");
+            box.classList.remove("a");
+            document.body.setAttribute("data-html", box.innerHTML);
+            document.body.setAttribute("data-has", String(box.classList.contains("b")));
+        </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        let body = find_tag(&doc, "body").expect("body");
+        assert!(doc.attr(body, "data-html").unwrap_or("").contains("<span>"), "{:?}", doc.attr(body, "data-html"));
+        assert_eq!(doc.attr(body, "data-has"), Some("true"));
+        assert_eq!(doc.attr(find_id(&doc, "box").unwrap(), "class"), Some("b"));
+    }
+
+    #[test]
+    fn bing_style_aliases_exist() {
+        let mut doc = parse(
+            r#"<body><p id="msg"></p><script>
+            document.getElementById("msg").textContent =
+              (typeof _w !== "undefined") + "," + (typeof _d !== "undefined") + "," + (typeof _G !== "undefined");
+        </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        assert_eq!(doc.text_content(find_id(&doc, "msg").unwrap()), "true,true,true");
+    }
+
+    #[test]
+    fn window_property_mirrors_to_global() {
+        let mut doc = parse(
+            r#"<body><p id="msg"></p>
+            <script>window._G = { ok: 1 };</script>
+            <script>document.getElementById("msg").textContent = String(_G.ok);</script>
+            </body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        assert_eq!(doc.text_content(find_id(&doc, "msg").unwrap()), "1");
     }
 }

@@ -5,6 +5,7 @@ use encoding_rs::{Encoding, UTF_8};
 use ureq::Agent;
 
 const MAX_BODY: u64 = 2 * 1024 * 1024;
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Pelago/0.1";
 
 #[derive(Debug)]
 pub struct Page {
@@ -76,11 +77,31 @@ pub fn exchange(method: &str, url: &str, body: Option<&str>) -> Result<HttpRespo
     let agent: Agent = config.into();
     let method = method.trim().to_ascii_uppercase();
     let mut response = match method.as_str() {
-        "POST" => agent.post(url).send(body.unwrap_or("")),
-        "PUT" => agent.put(url).send(body.unwrap_or("")),
-        "DELETE" => agent.delete(url).call(),
-        "HEAD" => agent.head(url).call(),
-        _ => agent.get(url).call(),
+        "POST" => agent
+            .post(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .send(body.unwrap_or("")),
+        "PUT" => agent
+            .put(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .send(body.unwrap_or("")),
+        "DELETE" => agent
+            .delete(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .call(),
+        "HEAD" => agent
+            .head(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .call(),
+        _ => agent
+            .get(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .call(),
     }
     .map_err(|err| FetchError::Http(err.to_string()))?;
     let status = response.status().as_u16();
@@ -117,6 +138,11 @@ pub fn fetch_bytes(url: &str, limit: u64) -> Result<BytesResponse, FetchError> {
     let agent: Agent = config.into();
     let mut response = agent
         .get(url)
+        .header("User-Agent", USER_AGENT)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
         .call()
         .map_err(|err| FetchError::Http(err.to_string()))?;
 

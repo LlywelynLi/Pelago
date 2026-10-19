@@ -18,9 +18,12 @@ src/
 cargo run
 cargo run -- <url>
 cargo run -- --html "<html>"
+cargo run -- --smoke <url>
 ```
 
 不带参数时会打开欢迎页，可在地址栏输入网址继续浏览。
+
+`--smoke` 无窗口拉取页面并跑脚本，打印失败数与未实现 API Top 列表（路线图 Phase 0 验收）。
 
 ## JavaScript
 

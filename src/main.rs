@@ -21,20 +21,43 @@ p { margin: 0; color: #555; }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let source = match args.next().as_deref() {
+    match args.next().as_deref() {
+        Some("--smoke") => {
+            let Some(url) = args.next() else {
+                eprintln!("用法: pelago --smoke <url>");
+                std::process::exit(2);
+            };
+            match engine::js::smoke_page(&url) {
+                Ok(result) => {
+                    std::process::exit(if result.failures == 0 { 0 } else { 1 });
+                }
+                Err(err) => {
+                    eprintln!("smoke 失败：{err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("--html") => {
             let Some(html) = args.next() else {
                 eprintln!("用法: pelago --html <html>");
                 std::process::exit(2);
             };
-            PageSource::Html(html)
+            if let Err(err) = app::open(PageSource::Html(html)) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
         }
-        Some(url) => PageSource::Url(url.to_string()),
-        None => PageSource::Html(HOME_HTML.to_string()),
-    };
-
-    if let Err(err) = app::open(source) {
-        eprintln!("{err}");
-        std::process::exit(1);
+        Some(url) => {
+            if let Err(err) = app::open(PageSource::Url(url.to_string())) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        None => {
+            if let Err(err) = app::open(PageSource::Html(HOME_HTML.to_string())) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
     }
 }
