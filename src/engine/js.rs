@@ -121,7 +121,11 @@ pub fn run_scripts_with(
     for (index, source) in scripts.iter().enumerate() {
         // 单脚本失败不中断后续脚本（失败隔离）。
         if let Err(err) = context.eval(Source::from_bytes(source.as_bytes())) {
-            note_script_failure(&format!("#{}/{}: {err}", index + 1, script_count));
+            let message = format!("#{}/{}: {err}", index + 1, script_count);
+            note_script_failure(&message);
+            if std::env::var_os("PELAGO_SCRIPT_CONTEXT").is_some() {
+                eprintln!("{}", script_error_context(source, &err.to_string()));
+            }
         }
         drain_timers(&mut context);
     }
@@ -157,6 +161,31 @@ fn reset_script_stats() {
     SCRIPT_FAILURES.with(|slot| slot.set(0));
     SCRIPT_SAMPLES.with(|slot| slot.borrow_mut().clear());
     API_MISSES.with(|slot| slot.borrow_mut().clear());
+}
+
+fn script_error_context(source: &str, err: &str) -> String {
+    let mut out = String::new();
+    for token in err.split("at :") {
+        let Some(rest) = token.get(..token.find([' ', '\n', ')']).unwrap_or(token.len())) else {
+            continue;
+        };
+        let mut parts = rest.split(':');
+        let (Some(line), Some(col)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(line) = line.parse::<usize>() else { continue };
+        let Ok(col) = col.parse::<usize>() else { continue };
+        let Some(text) = source.lines().nth(line.saturating_sub(1)) else {
+            continue;
+        };
+        let start = col.saturating_sub(80);
+        let end = (col + 40).min(text.len());
+        if start >= text.len() {
+            continue;
+        }
+        out.push_str(&format!("  ctx L{line}:{col} …{}\n", &text[start..end]));
+    }
+    out
 }
 
 fn note_script_failure(message: &str) {
@@ -392,17 +421,37 @@ fn install_location(
 
     let get_fn = get_href.to_js_function(context.realm());
     let set_fn = set_href.to_js_function(context.realm());
+    let mut part_getters = Vec::new();
+    for part in ["protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin"] {
+        let state = state.clone();
+        let part_name = part.to_string();
+        let getter = unsafe {
+            NativeFunction::from_closure(move |_, _, _| {
+                let href = state.borrow().href.clone();
+                Ok(JsValue::from(JsString::from(location_part(&href, &part_name).as_str())))
+            })
+        };
+        part_getters.push((JsString::from(part), getter.to_js_function(context.realm())));
+    }
 
-    let location = ObjectInitializer::new(context)
-        .accessor(
-            js_string!("href"),
-            Some(get_fn),
-            Some(set_fn),
-            Attribute::WRITABLE | Attribute::CONFIGURABLE | Attribute::ENUMERABLE,
-        )
-        .function(replace, js_string!("replace"), 1)
-        .function(assign, js_string!("assign"), 1)
-        .build();
+    let mut location_builder = ObjectInitializer::new(context);
+    location_builder.accessor(
+        js_string!("href"),
+        Some(get_fn),
+        Some(set_fn),
+        Attribute::WRITABLE | Attribute::CONFIGURABLE | Attribute::ENUMERABLE,
+    );
+    location_builder.function(replace, js_string!("replace"), 1);
+    location_builder.function(assign, js_string!("assign"), 1);
+    for (name, getter) in part_getters {
+        location_builder.accessor(
+            name,
+            Some(getter),
+            None,
+            Attribute::CONFIGURABLE | Attribute::ENUMERABLE,
+        );
+    }
+    let location = location_builder.build();
 
     context.register_global_property(js_string!("location"), location.clone(), Attribute::all())?;
 
@@ -1714,6 +1763,27 @@ fn copy_node(src: &Document, id: NodeId, dst: &mut Document, parent: NodeId) {
     }
 }
 
+fn location_part(href: &str, part: &str) -> String {
+    let Ok(parsed) = url::Url::parse(href) else {
+        return String::new();
+    };
+    match part {
+        "protocol" => format!("{}:", parsed.scheme()),
+        "hostname" => parsed.host_str().unwrap_or("").to_string(),
+        "port" => parsed.port().map(|port| port.to_string()).unwrap_or_default(),
+        "host" => match (parsed.host_str(), parsed.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            _ => String::new(),
+        },
+        "pathname" => parsed.path().to_string(),
+        "search" => parsed.query().map(|query| format!("?{query}")).unwrap_or_default(),
+        "hash" => parsed.fragment().map(|fragment| format!("#{fragment}")).unwrap_or_default(),
+        "origin" => parsed.origin().ascii_serialization(),
+        _ => String::new(),
+    }
+}
+
 fn queue_navigation(state: &Rc<RefCell<NavState>>, base: &str, raw: &str, kind: NavigationKind) {
     let url = match resolve_url(Some(base), raw).or_else(|| normalize_navigation(raw).ok()) {
         Some(url) => url,
@@ -1743,6 +1813,24 @@ mod tests {
             .expect("navigation");
         assert_eq!(nav.url, "http://www.baidu.com/");
         assert_eq!(nav.kind, NavigationKind::Replace);
+    }
+
+    #[test]
+    fn location_exposes_url_parts() {
+        let mut doc = parse(
+            r#"<body><p id="msg"></p><script>
+            var path = location.pathname;
+            var host = location.hostname;
+            document.getElementById("msg").textContent =
+              location.protocol + "|" + host + "|" + path + "|" + (host.match(/bing/) ? "ok" : "no") + "|" + path.indexOf("/");
+        </script></body>"#,
+        );
+        let result = run_scripts_with(&mut doc, "https://www.bing.com/search?q=1", &|_| Err("无外部脚本".into()));
+        assert_eq!(result.failures, 0, "samples={:?}", result.samples);
+        assert_eq!(
+            doc.text_content(find_id(&doc, "msg").unwrap()),
+            "https:|www.bing.com|/search|ok|0"
+        );
     }
 
     #[test]
