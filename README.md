@@ -24,11 +24,11 @@ cargo run -- --html "<html>"
 
 ## JavaScript
 
-内嵌 [Boa](https://boajs.dev/) 引擎。会执行内联脚本和 `<script src>`，并提供 `location`、`navigator`、`console`、`setTimeout` / `setInterval`（回调立即执行一次），以及最小 DOM API：`getElementById`、`querySelector`、`querySelectorAll`、`getElementsByTagName`、`createElement`、`appendChild`、`textContent`、`className`、`innerHTML`、`addEventListener`（空实现）。
+内嵌 [Boa](https://boajs.dev/) 引擎。会执行内联脚本和 `<script src>`，并提供 `location`、`navigator`、`console`、`Image`、`define` / `require`（最小 AMD）、`setTimeout` / `setInterval`（回调立即执行一次），以及最小 DOM API：`getElementById`、`querySelector`、`querySelectorAll`、`getElementsByTagName`、`createElement`、`appendChild`、`textContent`、`className`、`innerHTML`、`src`、`addEventListener`（空实现）。
 
 样式会下载 `<link rel="stylesheet">` 和 `@import`。选择器支持标签、class、id、后代和子代。布局支持 `flex`、`grid`、`float` 和 `position: absolute`。
 
-`$`、`define`、`bds` 这类页面自己的全局变量，要等对应脚本成功执行后才会出现。当前没有真正的事件循环和完整 DOM。
+`$`、`bds`、`F` 是页面脚本自己创建的全局变量。前面的脚本如果中途抛错，这些名字就不会出现。当前没有真正的事件循环和完整 DOM。
 
 ## 构建
 

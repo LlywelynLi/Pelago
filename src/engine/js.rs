@@ -364,11 +364,21 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
     let get_class = get_class.to_js_function(context.realm());
     let set_class = set_class.to_js_function(context.realm());
     let set_html = set_html.to_js_function(context.realm());
+    let (get_src, set_src) = attr_accessor(doc, "src", context);
+    let (get_id, set_id) = attr_accessor(doc, "id", context);
+    let (get_href, set_href) = attr_accessor(doc, "href", context);
+    let (get_width, set_width) = attr_accessor(doc, "width", context);
+    let (get_height, set_height) = attr_accessor(doc, "height", context);
     let object = ObjectInitializer::new(context)
         .property(js_string!("pelagoId"), id.0 as u32, Attribute::READONLY)
         .accessor(js_string!("textContent"), Some(get_text), Some(set_text), Attribute::all())
         .accessor(js_string!("className"), Some(get_class), Some(set_class), Attribute::all())
         .accessor(js_string!("innerHTML"), None, Some(set_html), Attribute::all())
+        .accessor(js_string!("src"), Some(get_src), Some(set_src), Attribute::all())
+        .accessor(js_string!("id"), Some(get_id), Some(set_id), Attribute::all())
+        .accessor(js_string!("href"), Some(get_href), Some(set_href), Attribute::all())
+        .accessor(js_string!("width"), Some(get_width), Some(set_width), Attribute::all())
+        .accessor(js_string!("height"), Some(get_height), Some(set_height), Attribute::all())
         .function(append_child, js_string!("appendChild"), 1)
         .function(noop(), js_string!("addEventListener"), 2)
         .function(noop(), js_string!("removeEventListener"), 2)
@@ -386,6 +396,25 @@ fn element_value(id: NodeId, doc: *mut Document, context: &mut Context) -> JsRes
 
 thread_local! {
     static TIMER_DEPTH: Cell<u32> = Cell::new(0);
+}
+
+fn attr_accessor(doc: *mut Document, name: &'static str, context: &mut Context) -> (boa_engine::object::builtins::JsFunction, boa_engine::object::builtins::JsFunction) {
+    let get = NativeFunction::from_copy_closure(move |this, _, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let value = unsafe { (*doc).attr(node, name).unwrap_or("").to_string() };
+        Ok(JsValue::from(JsString::from(value.as_str())))
+    });
+    let set = NativeFunction::from_copy_closure(move |this, args, context| {
+        let Some(node) = node_id(this, context)? else {
+            return Ok(JsValue::undefined());
+        };
+        let value = args.get_or_undefined(0).to_string(context)?;
+        unsafe { (*doc).set_attr(node, name, value.to_std_string_escaped()) };
+        Ok(JsValue::undefined())
+    });
+    (get.to_js_function(context.realm()), set.to_js_function(context.realm()))
 }
 
 fn noop() -> NativeFunction {
@@ -437,8 +466,60 @@ fn install_host(context: &mut Context) -> JsResult<()> {
         window.set(js_string!("setInterval"), interval, false, context)?;
         window.set(js_string!("document"), context.global_object().get(js_string!("document"), context)?, false, context)?;
     }
+    context.eval(Source::from_bytes(HOST_SHIM))?;
     Ok(())
 }
+
+const HOST_SHIM: &str = r#"
+function Image() {
+    return document.createElement("img");
+}
+window.Image = Image;
+var __pelagoModules = Object.create(null);
+function require(id, callback) {
+    if (typeof id === "function") {
+        id();
+        return {};
+    }
+    if (Array.isArray(id)) {
+        var loaded = id.map(function (name) { return require(name); });
+        if (typeof callback === "function") callback.apply(null, loaded);
+        return loaded[0];
+    }
+    if (Object.prototype.hasOwnProperty.call(__pelagoModules, id)) return __pelagoModules[id];
+    return {};
+}
+require.addPaths = function () {};
+require.config = function () {};
+function define(name, deps, factory) {
+    if (typeof name !== "string") {
+        factory = deps;
+        deps = name;
+        name = "";
+    }
+    if (!Array.isArray(deps)) {
+        factory = deps;
+        deps = [];
+    }
+    var exports = {};
+    var module = { exports: exports };
+    var result = factory;
+    if (typeof factory === "function") {
+        var args = deps.map(function (dep) {
+            if (dep === "require") return require;
+            if (dep === "exports") return exports;
+            if (dep === "module") return module;
+            return require(dep);
+        });
+        result = factory.apply(null, args);
+        if (result === undefined) result = module.exports;
+    }
+    __pelagoModules[name || ("anon-" + Object.keys(__pelagoModules).length)] = result;
+}
+define.amd = {};
+window.define = define;
+window.require = require;
+"#;
 
 fn invoke_timer(args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let Some(function) = args.get_or_undefined(0).as_callable() else {
@@ -691,5 +772,22 @@ mod tests {
         let text = doc.text_content(doc.root());
         assert!(text.contains("Win32"), "{text}");
         assert!(!text.contains("old"), "{text}");
+    }
+
+    #[test]
+    fn image_and_define_require() {
+        let mut doc = parse(r#"<body><p id="msg"></p><script>
+            var img = new Image();
+            img.src = "https://example.com/a.png";
+            document.body.appendChild(img);
+            define("mod", [], function () { return { ok: "ready" }; });
+            require(["mod"], function (mod) {
+                document.getElementById("msg").textContent = mod.ok + img.src;
+            });
+        </script></body>"#);
+        assert!(run_scripts_with(&mut doc, "https://example.com/", &|_| Err("无外部脚本".into())).is_none());
+        let text = doc.text_content(doc.root());
+        assert!(text.contains("readyhttps://example.com/a.png"), "{text}");
+        assert!(doc.nodes.iter().any(|node| matches!(&node.data, NodeData::Element { tag, attrs } if tag == "img" && attrs.iter().any(|(key, value)| key == "src" && value == "https://example.com/a.png"))));
     }
 }
